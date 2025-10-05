@@ -1,0 +1,2 @@
+selenium>=4.14.0,<5.0.0
+tzdata>=2023.3; platform_system == "Windows"
