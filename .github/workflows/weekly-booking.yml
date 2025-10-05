@@ -57,7 +57,6 @@ jobs:
           MIGOLF_PASS_3: ${{ secrets.MIGOLF_PASS_3 }}
           PREFERRED_DAY:  ${{ secrets.PREFERRED_DAY }}
           PREFERRED_TIME: ${{ secrets.PREFERRED_TIME }}
-          FORCE_RUN: "1"              # keep for manual test; remove after
           PYTHONUNBUFFERED: "1"       # <-- live logs
         run: |
           set -euo pipefail
