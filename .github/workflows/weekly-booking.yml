@@ -1,0 +1,73 @@
+name: Weekly golf booking (Sydney 7 pm Thu)
+
+on:
+  schedule:
+    # Run at 08:00 UTC and 09:00 UTC every Thursday
+    - cron: "0 8 * * 4"
+    - cron: "0 9 * * 4"
+  workflow_dispatch: {}  # allows manual run
+
+jobs:
+  book:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: golf-booking
+      cancel-in-progress: false
+    env:
+      TZ: Australia/Sydney
+      HEADLESS: "true"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install Google Chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Install Chromedriver
+        uses: nanasess/setup-chromedriver@v2
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run booking script
+        env:
+          MIGOLF_USER_1: ${{ secrets.MIGOLF_USER_1 }}
+          MIGOLF_PASS_1: ${{ secrets.MIGOLF_PASS_1 }}
+          MIGOLF_USER_2: ${{ secrets.MIGOLF_USER_2 }}
+          MIGOLF_PASS_2: ${{ secrets.MIGOLF_PASS_2 }}
+          MIGOLF_USER_3: ${{ secrets.MIGOLF_USER_3 }}
+          MIGOLF_PASS_3: ${{ secrets.MIGOLF_PASS_3 }}
+          PREFERRED_DAY:  ${{ secrets.PREFERRED_DAY }}
+          PREFERRED_TIME: ${{ secrets.PREFERRED_TIME }}
+        run: |
+          python booking_script.py --really-book
+
+      - name: Upload run logs (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-artifacts
+          path: |
+            logs/**
+            evidence/**
+            **/*.html
+            **/*.png
+          if-no-files-found: ignore
