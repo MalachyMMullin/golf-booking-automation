@@ -57,6 +57,7 @@ jobs:
           MIGOLF_PASS_3: ${{ secrets.MIGOLF_PASS_3 }}
           PREFERRED_DAY:  ${{ secrets.PREFERRED_DAY }}
           PREFERRED_TIME: ${{ secrets.PREFERRED_TIME }}
+          FORCE_RUN: "1"
         run: |
           python booking_script.py --really-book
 
