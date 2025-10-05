@@ -57,9 +57,16 @@ jobs:
           MIGOLF_PASS_3: ${{ secrets.MIGOLF_PASS_3 }}
           PREFERRED_DAY:  ${{ secrets.PREFERRED_DAY }}
           PREFERRED_TIME: ${{ secrets.PREFERRED_TIME }}
-          FORCE_RUN: "1"
+          FORCE_RUN: "1"              # keep for manual test; remove after
+          PYTHONUNBUFFERED: "1"       # <-- live logs
         run: |
-          python booking_script.py --really-book
+          set -euo pipefail
+          echo "=== Chrome versions ==="
+          google-chrome --version || true
+          chromedriver --version || true
+          echo "=== Starting booking_script.py ==="
+          python -u booking_script.py --really-book
+          echo "=== Script finished ==="
 
       - name: Upload run logs (optional)
         if: always()
