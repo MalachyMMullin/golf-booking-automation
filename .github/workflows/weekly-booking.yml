@@ -60,6 +60,14 @@ jobs:
           PYTHONUNBUFFERED: "1"       # <-- live logs
         run: |
           set -euo pipefail
+          # Guard scheduled runs so we only actually book at 19:00 Sydney local time
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            SYD_HOUR=$(TZ=Australia/Sydney date +%H)
+            if [ "$SYD_HOUR" != "19" ]; then
+              echo "Skipping: not 19:00 Australia/Sydney (current hour=$SYD_HOUR)."
+              exit 0
+            fi
+          fi
           echo "=== Chrome versions ==="
           google-chrome --version || true
           chromedriver --version || true
