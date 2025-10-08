@@ -66,21 +66,21 @@ PLAYERS_TO_VERIFY = [
     "Cheney",
 ]
 
-EXPECTED_GROUPS = {
-    "2007": ["Mullin", "Hillard", "Rutherford", "Rudge"],
-    "1107": ["Cheney", "Lalor"],
-    # "2008": [...],  # add if you want modal validation for fallback too
-}
-
-
-def expected_group_for(booker_username: str) -> List[str]:
-    return EXPECTED_GROUPS.get(booker_username, [])
+# Note: name validation removed; no expected group mapping required.
 
 
 OPEN_POLL_INTERVAL_SEC = 2
-YES_BUTTON_WAIT_SEC = 15
-TEE_SHEET_WAIT_FIRST = 120  # after 19:00 rush
-TEE_SHEET_WAIT_SUBSEQUENT = 60
+YES_BUTTON_WAIT_BASE_SEC = 20  # modal wait starts at 20s and expands each retry
+YES_BUTTON_WAIT_STEP_SEC = 5
+YES_BUTTON_WAIT_MAX_SEC = 40
+TEE_SHEET_WAIT_INITIAL_SEC = 30  # tee-sheet wait grows by 15s per attempt up to 90s
+TEE_SHEET_WAIT_STEP_SEC = 15
+TEE_SHEET_WAIT_MAX_SEC = 90
+BOOKING_VERIFY_TIMEOUT_SEC = 30
+BOOKING_VERIFY_POLL_INTERVAL_SEC = 1.5
+JOB_MAX_RUNTIME_SEC = 2700  # hard cap on total job runtime (45 minutes)
+UNLOCK_WAIT_BOOKING_SEC = 900  # max wait for bookings to open during booking flows (15 min)
+UNLOCK_WAIT_VERIFY_SEC = 60  # max wait during verification (1 min)
 
 # Logging/snapshot paths
 RUN_ROOT = Path.home() / "golfbot_logs"
@@ -194,7 +194,7 @@ def make_driver() -> webdriver.Chrome:
                 f"(using {driver_path or 'auto-managed'} driver)"
             )
             drv = webdriver.Chrome(options=opts, service=service)
-            drv.set_page_load_timeout(90)
+            drv.set_page_load_timeout(120)
             return drv
         except Exception as exc:  # noqa: BLE001 - we retry after cleanup
             last_err = exc
@@ -272,7 +272,7 @@ def _wait_confirm_or_alert(driver: webdriver.Chrome, timeout: int) -> Tuple[str,
 
 # --- Modal readers/validators -------------------------------------------------------
 def _read_confirm_modal(
-    driver: webdriver.Chrome, timeout: int = 8
+    driver: webdriver.Chrome, timeout: int = 15
 ) -> Tuple[object, str, object | None, object | None]:
     """Fetch the confirmation modal and key controls."""
 
@@ -311,11 +311,48 @@ def _read_confirm_modal(
     return modal, text, yes_btn, cancel_btn
 
 
-def _modal_contains_expected_names(
-    modal_text: str, expected_surnames: List[str]
-) -> Tuple[bool, List[str]]:
-    missing = [surname for surname in expected_surnames if surname not in modal_text]
-    return len(missing) == 0, missing
+# Modal parsing helpers
+
+
+def _parse_modal_names(modal_text: str) -> List[str]:
+    """Extract player names from the booking confirmation modal."""
+
+    names: List[str] = []
+    for line in modal_text.splitlines():
+        candidate = line.strip()
+        if not candidate or "," not in candidate:
+            continue
+        # Remove trailing helper tokens such as [H]
+        names.append(candidate.split("[")[0].strip())
+    return names
+
+
+def _wait_row_booked(
+    driver: webdriver.Chrome, row_id: str, expected_names: List[str]
+) -> bool:
+    """Wait until the row shows the expected player surnames."""
+
+    if not row_id:
+        return False
+
+    expected_surnames = {name.split(",")[0].strip().lower() for name in expected_names if "," in name}
+    expected_surnames.update(name.lower() for name in expected_names if "," not in name)
+
+    deadline = time.time() + BOOKING_VERIFY_TIMEOUT_SEC
+    while time.time() < deadline:
+        try:
+            row = driver.find_element(By.ID, row_id)
+            row_text = row.text.lower()
+            if expected_surnames and all(surname in row_text for surname in expected_surnames):
+                return True
+            if not expected_surnames and row.find_elements(By.CLASS_NAME, "my-booking"):
+                return True
+        except StaleElementReferenceException:
+            pass
+        except Exception:
+            pass
+        time.sleep(BOOKING_VERIFY_POLL_INTERVAL_SEC)
+    return False
 
 
 # ------------------------------------------------------------------------------------
@@ -325,7 +362,7 @@ def login(driver: webdriver.Chrome, username: str, password: str) -> bool:
     log(f"\nAttempting to log in as user: {username}")
     start = time.time()
     driver.get(LOGIN_URL)
-    user_field = WebDriverWait(driver, 30).until(
+    user_field = WebDriverWait(driver, 45).until(
         EC.presence_of_element_located((By.NAME, "user"))
     )
     user_field.clear()
@@ -334,7 +371,7 @@ def login(driver: webdriver.Chrome, username: str, password: str) -> bool:
     pw_field.clear()
     pw_field.send_keys(password)
     driver.find_element(By.XPATH, "//input[@value='Login']").click()
-    WebDriverWait(driver, 30).until(
+    WebDriverWait(driver, 45).until(
         EC.presence_of_element_located((By.XPATH, "//a[contains(@href, 'logout')]"))
     )
     log(f"Login successful for user: {username} (took {time.time() - start:.2f}s)")
@@ -346,23 +383,26 @@ def logout(driver: webdriver.Chrome) -> None:
         log("Attempting to log out...")
         time.sleep(1.5)
         driver.get(LOGOUT_URL)
-        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.NAME, "user")))
+        WebDriverWait(driver, 40).until(EC.presence_of_element_located((By.NAME, "user")))
         log("Logout successful.")
     except Exception as exc:  # noqa: BLE001 - best effort logout
         log(f"WARNING: Could not confirm logout. REASON: {exc}")
 
 
-def navigate_and_wait_for_unlock(driver: webdriver.Chrome) -> bool:
+def navigate_and_wait_for_unlock(
+    driver: webdriver.Chrome, max_wait_seconds: int = UNLOCK_WAIT_BOOKING_SEC
+) -> bool:
     log("Navigating to event list and waiting for bookings to open...")
     driver.get(EVENT_LIST_URL)
-    while True:
+    deadline = time.time() + max_wait_seconds
+    while time.time() < deadline:
         try:
             event_div_xpath = (
                 f"//div[contains(@class, 'full') and "
                 f".//span[contains(., '{target_day_name}')] and "
                 f".//span[contains(., '{target_date_combo}')]]"
             )
-            target_event_div = WebDriverWait(driver, 20).until(
+            target_event_div = WebDriverWait(driver, 40).until(
                 EC.presence_of_element_located((By.XPATH, event_div_xpath))
             )
             link = target_event_div.find_element(By.TAG_NAME, "a")
@@ -385,6 +425,10 @@ def navigate_and_wait_for_unlock(driver: webdriver.Chrome) -> bool:
             log(f"Page not ready, refreshing... REASON: {exc}")
             time.sleep(3)
             driver.refresh()
+    log(
+        f"TIMEOUT: Booking did not open within {max_wait_seconds}s for {target_date_combo}."
+    )
+    return False
 
 
 def execute_group_booking(
@@ -401,8 +445,20 @@ def execute_group_booking(
     while attempt < max_attempts:
         attempt += 1
         try:
-            tee_wait = TEE_SHEET_WAIT_FIRST if attempt == 1 else TEE_SHEET_WAIT_SUBSEQUENT
-            log(f"\nAttempt #{attempt}/{max_attempts} (tee-sheet wait {tee_wait}s)...")
+            tee_wait = min(
+                TEE_SHEET_WAIT_INITIAL_SEC
+                + TEE_SHEET_WAIT_STEP_SEC * (attempt - 1),
+                TEE_SHEET_WAIT_MAX_SEC,
+            )
+            confirm_wait = min(
+                YES_BUTTON_WAIT_BASE_SEC
+                + YES_BUTTON_WAIT_STEP_SEC * (attempt - 1),
+                YES_BUTTON_WAIT_MAX_SEC,
+            )
+            log(
+                f"\nAttempt #{attempt}/{max_attempts} "
+                f"(tee-sheet wait {tee_wait}s, confirm wait {confirm_wait}s)..."
+            )
 
             if not _wait_teetime_table(driver, timeout=tee_wait):
                 snap_png(driver, f"attempt{attempt}_no_table")
@@ -416,7 +472,7 @@ def execute_group_booking(
             snap_png(driver, f"attempt{attempt}_sheet_loaded")
 
             all_rows = driver.find_elements(By.XPATH, "//div[contains(@class, 'row-time')]")
-            target_row = None
+            target_row: WebElement | None = None
             for row in all_rows:
                 try:
                     empties = row.find_elements(By.XPATH, ".//button[contains(@class, 'btn-book-me')]")
@@ -433,6 +489,7 @@ def execute_group_booking(
                 time.sleep(4)
                 continue
 
+            row_dom_id = target_row.get_attribute("id") or ""
             try:
                 time_text = target_row.find_element(By.TAG_NAME, "h3").text
             except Exception:
@@ -447,7 +504,7 @@ def execute_group_booking(
                 driver.execute_script("arguments[0].click();", btn_group)
             snap_png(driver, f"attempt{attempt}_after_book_group_click")
 
-            which, obj = _wait_confirm_or_alert(driver, timeout=YES_BUTTON_WAIT_SEC)
+            which, obj = _wait_confirm_or_alert(driver, timeout=confirm_wait)
             if which == "alert":
                 log("    -> Slot locked by another user. Refresh + retry...")
                 snap_png(driver, f"attempt{attempt}_alert")
@@ -456,40 +513,18 @@ def execute_group_booking(
                 continue
 
             if which == "modal":
+                expected_names: List[str] = []
                 try:
                     modal, modal_text, yes_button, cancel_button = _read_confirm_modal(
-                        driver, timeout=YES_BUTTON_WAIT_SEC
+                        driver, timeout=confirm_wait
                     )
+                    expected_names = _parse_modal_names(modal_text)
                 except Exception as exc:  # noqa: BLE001 - we will retry
                     log(f"    -> Modal read failed: {exc}. Refresh + retry...")
                     snap_png(driver, f"attempt{attempt}_modal_read_failed")
                     driver.refresh()
                     time.sleep(3)
                     continue
-
-                expected = expected_group_for(booker_username)
-                if expected:
-                    ok, missing = _modal_contains_expected_names(modal_text, expected)
-                    preview = modal_text[:200].replace("\n", " ")
-                    log(
-                        f"Modal text preview: {preview}" + ("..." if len(modal_text) > 200 else "")
-                    )
-                    if not ok:
-                        log(
-                            "    -> EXPECTED NAMES NOT FOUND for "
-                            f"{booker_username}. Missing: {', '.join(missing)}"
-                        )
-                        if cancel_button:
-                            try:
-                                cancel_button.click()
-                                log("    -> Cancelled modal due to mismatch. Trying next slot...")
-                            except Exception:
-                                log("    -> Could not click Cancel; refreshing...")
-                        else:
-                            log("    -> No cancel button detected; refreshing...")
-                        driver.refresh()
-                        time.sleep(2)
-                        continue
 
                 if yes_button is None:
                     log("    -> No Yes/Confirm button found in modal; refresh + retry...")
@@ -498,13 +533,31 @@ def execute_group_booking(
                     time.sleep(3)
                     continue
 
-                log("Confirmation modal appeared and names validated. Clicking to finalise booking.")
+                log("Confirmation modal appeared. Clicking to finalise booking.")
                 try:
                     yes_button.click()
                 except ElementClickInterceptedException:
                     driver.execute_script("arguments[0].click();", yes_button)
                 log(f"SUCCESS: Booking command sent for {booker_username}'s group.")
                 snap_png(driver, f"attempt{attempt}_after_confirm_click")
+                verified = False
+                if expected_names:
+                    verified = _wait_row_booked(driver, row_dom_id, expected_names)
+                    if verified:
+                        log("Confirmed tee sheet now shows expected playing partners.")
+                else:
+                    verified = _wait_row_booked(driver, row_dom_id, [])
+                    if verified:
+                        log("Confirmed tee sheet updated with booking for current user.")
+
+                if not verified:
+                    log(
+                        "WARNING: Could not confirm tee sheet contained expected names; treating as failed."
+                    )
+                    snap_png(driver, f"attempt{attempt}_no_confirmation")
+                    snap_html(driver, f"attempt{attempt}_no_confirmation")
+                    return False
+
                 return True
 
             log("    -> TIMEOUT waiting for confirm modal/alert. Refresh + retry...")
@@ -556,9 +609,10 @@ def _read_row_players(row: WebElement) -> List[str]:
 def verify_all_bookings(driver: webdriver.Chrome, all_players: List[str]) -> None:
     log("\n===== STARTING FINAL BOOKING VERIFICATION =====")
     try:
-        if not navigate_and_wait_for_unlock(driver):
+        # Keep verification bounded; do not wait indefinitely for unlock
+        if not navigate_and_wait_for_unlock(driver, max_wait_seconds=UNLOCK_WAIT_VERIFY_SEC):
             return
-        if not _wait_teetime_table(driver, timeout=45):
+        if not _wait_teetime_table(driver, timeout=10):
             log("WARNING: Tee sheet did not load for verification.")
             snap_png(driver, "verify_no_table")
             return
@@ -612,10 +666,12 @@ def main() -> None:
         group2_success = False
         group3_success = False
 
+        job_start_time = time.time()
+
         try:
             log("\n===== STARTING BOOKING FOR GROUP 1 =====")
             if login(driver, BOOKER_1_USERNAME, BOOKER_1_PASSWORD):
-                if navigate_and_wait_for_unlock(driver):
+                if navigate_and_wait_for_unlock(driver, max_wait_seconds=UNLOCK_WAIT_BOOKING_SEC):
                     group1_success = execute_group_booking(
                         driver,
                         BOOKER_1_USERNAME,
@@ -624,11 +680,14 @@ def main() -> None:
                     )
                     logout(driver)
 
-            if group1_success:
+            # Job-wide timeout check before proceeding to Group 2
+            if time.time() - job_start_time > JOB_MAX_RUNTIME_SEC:
+                log("JOB TIMEOUT REACHED before Group 2. Aborting remaining flows.")
+            elif group1_success:
                 log("\n===== STARTING BOOKING FOR GROUP 2 (only because G1 succeeded) =====")
                 time.sleep(5)
                 if login(driver, BOOKER_2_USERNAME, BOOKER_2_PASSWORD):
-                    if navigate_and_wait_for_unlock(driver):
+                    if navigate_and_wait_for_unlock(driver, max_wait_seconds=UNLOCK_WAIT_BOOKING_SEC):
                         group2_success = execute_group_booking(
                             driver,
                             BOOKER_2_USERNAME,
@@ -639,11 +698,14 @@ def main() -> None:
             else:
                 log("\n[INFO] Skipping Group 2 (Group 1 did not succeed).")
 
-            if not group1_success:
+            # Job-wide timeout check before proceeding to Group 3
+            if time.time() - job_start_time > JOB_MAX_RUNTIME_SEC:
+                log("JOB TIMEOUT REACHED before Group 3. Aborting remaining flows.")
+            elif not group1_success:
                 log("\n===== STARTING BOOKING FOR GROUP 3 (BACKUP because G1 failed) =====")
                 time.sleep(5)
                 if login(driver, BOOKER_3_USERNAME, BOOKER_3_PASSWORD):
-                    if navigate_and_wait_for_unlock(driver):
+                    if navigate_and_wait_for_unlock(driver, max_wait_seconds=UNLOCK_WAIT_BOOKING_SEC):
                         group3_success = execute_group_booking(
                             driver,
                             BOOKER_3_USERNAME,
@@ -654,7 +716,10 @@ def main() -> None:
             else:
                 log("\n[INFO] Skipping Group 3 (backup not needed because G1 succeeded).")
 
-            if group1_success or group2_success or group3_success:
+            # Job-wide timeout check before verification
+            if time.time() - job_start_time > JOB_MAX_RUNTIME_SEC:
+                log("JOB TIMEOUT REACHED before verification. Skipping verification.")
+            elif group1_success or group2_success or group3_success:
                 if login(driver, BOOKER_1_USERNAME, BOOKER_1_PASSWORD):
                     verify_all_bookings(driver, PLAYERS_TO_VERIFY)
                     logout(driver)
