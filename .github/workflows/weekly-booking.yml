@@ -2,9 +2,10 @@ name: Weekly golf booking (Sydney 7 pm Thu)
 
 on:
   schedule:
-    # Run at 08:00 UTC and 09:00 UTC every Thursday
-    - cron: "0 8 * * 4"
-    - cron: "0 9 * * 4"
+    # Run at 07:59 UTC and 08:59 UTC every Thursday
+    # (maps to 18:59 Sydney during AEDT and AEST respectively)
+    - cron: "59 7 * * 4"
+    - cron: "59 8 * * 4"
   workflow_dispatch: {}  # allows manual run
 
 jobs:
@@ -60,11 +61,13 @@ jobs:
           PYTHONUNBUFFERED: "1"       # <-- live logs
         run: |
           set -euo pipefail
-          # Guard scheduled runs so we only actually book at 19:00 Sydney local time
+          # Guard scheduled runs so we only proceed when it is ~18:59 Australia/Sydney
           if [ "${{ github.event_name }}" = "schedule" ]; then
             SYD_HOUR=$(TZ=Australia/Sydney date +%H)
-            if [ "$SYD_HOUR" != "19" ]; then
-              echo "Skipping: not 19:00 Australia/Sydney (current hour=$SYD_HOUR)."
+            SYD_MIN=$(TZ=Australia/Sydney date +%M)
+            SYD_TOTAL_MINUTES=$((10#$SYD_HOUR * 60 + 10#$SYD_MIN))
+            if [ "$SYD_TOTAL_MINUTES" -lt $((18 * 60 + 59)) ] || [ "$SYD_TOTAL_MINUTES" -gt $((19 * 60 + 2)) ]; then
+              echo "Skipping: not between 18:59 and 19:02 Australia/Sydney (current=${SYD_HOUR}:${SYD_MIN})."
               exit 0
             fi
           fi
