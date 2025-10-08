@@ -40,3 +40,33 @@ produces a zipped evidence bundle per run.
 
 The script emits verbose stdout logging and writes the same content to
 `run.log` for later inspection.
+
+## Running via GitHub Actions
+You can also exercise the automation in a GitHub-hosted runner using the
+workflows provided in [`.github/workflows`](.github/workflows).
+
+1. In your repository, open **Settings ▸ Secrets and variables ▸ Actions** and
+   add the required credentials as *Actions secrets*:
+   - `MIGOLF_USER_1`, `MIGOLF_PASS_1`
+   - `MIGOLF_USER_2`, `MIGOLF_PASS_2`
+   - `MIGOLF_USER_3`, `MIGOLF_PASS_3`
+   - Optional: `PREFERRED_DAY`, `PREFERRED_TIME` if you have downstream logic
+     that reads them.
+2. Navigate to the **Actions** tab, select the workflow you want to exercise,
+   and click **“Run workflow.”** You can trigger any workflow on the default
+   branch or specify a different ref for testing changes.
+   - **Weekly golf booking (Sydney 7 pm Thu):** production workflow that runs
+     `booking_script.py` on the scheduled Thursday evening cron as well as on
+     demand via the **Run workflow** button.
+   - **Manual Thursday booking test:** ad-hoc workflow that runs only when
+     manually triggered and executes `booking_script_thursday.py`. It accepts a
+     `really_book` toggle (defaults to `false`) so you can run dry tests, and a
+     `headless` toggle if you need to see the browser UI during debugging.
+3. GitHub Actions provisions Chrome/Chromedriver, installs the Python
+   dependencies, and executes the selected script with live logs streamed to the
+   workflow run page.
+4. When the run finishes, download the `run-artifacts` workflow artifact for any
+   evidence bundles, HTML captures, or screenshots produced during the run.
+
+Use workflow_dispatch runs for safe testing, and leave the scheduled triggers in
+place for production booking times.
