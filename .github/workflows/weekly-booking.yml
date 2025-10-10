@@ -2,16 +2,16 @@ name: Weekly golf booking (Sydney 7 pm Thu)
 
 on:
   schedule:
-    # Run at 07:59 UTC and 08:59 UTC every Thursday
-    # (maps to 18:59 Sydney during AEDT and AEST respectively)
-    - cron: "59 7 * * 4"
-    - cron: "59 8 * * 4"
+    # Run at 07:40 UTC and 08:40 UTC every Thursday
+    # (starts early so the job is live before the 19:00 Sydney unlock even with cron lag)
+    - cron: "40 7 * * 4"
+    - cron: "40 8 * * 4"
   workflow_dispatch: {}  # allows manual run
 
 jobs:
   book:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 50
     concurrency:
       group: golf-booking
       cancel-in-progress: false
@@ -63,13 +63,40 @@ jobs:
           set -euo pipefail
           # Guard scheduled runs so we only proceed when it is ~18:59 Australia/Sydney
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            SYD_HOUR=$(TZ=Australia/Sydney date +%H)
-            SYD_MIN=$(TZ=Australia/Sydney date +%M)
-            SYD_TOTAL_MINUTES=$((10#$SYD_HOUR * 60 + 10#$SYD_MIN))
-            if [ "$SYD_TOTAL_MINUTES" -lt $((18 * 60 + 59)) ] || [ "$SYD_TOTAL_MINUTES" -gt $((19 * 60 + 2)) ]; then
-              echo "Skipping: not between 18:59 and 19:02 Australia/Sydney (current=${SYD_HOUR}:${SYD_MIN})."
-              exit 0
-            fi
+            WINDOW_START=$((18 * 60 + 58))
+            WINDOW_END=$((19 * 60 + 2))
+            while true; do
+              SYD_HOUR=$(TZ=Australia/Sydney date +%H)
+              SYD_MIN=$(TZ=Australia/Sydney date +%M)
+              SYD_TOTAL_MINUTES=$((10#$SYD_HOUR * 60 + 10#$SYD_MIN))
+
+              if [ "$SYD_TOTAL_MINUTES" -lt "$WINDOW_START" ]; then
+                REMAIN_MINUTES=$((WINDOW_START - SYD_TOTAL_MINUTES))
+                # Sleep in shorter chunks (max 5 minutes) so logs stay active.
+                if [ "$REMAIN_MINUTES" -gt 5 ]; then
+                  SLEEP_SECONDS=$((5 * 60))
+                else
+                  SLEEP_SECONDS=$((REMAIN_MINUTES * 60))
+                fi
+                if [ "$SLEEP_SECONDS" -le 0 ]; then
+                  SLEEP_SECONDS=30
+                fi
+                echo "Booking guard: ${SYD_HOUR}:${SYD_MIN} Sydney. Sleeping ${SLEEP_SECONDS}s until 18:58."
+                sleep "$SLEEP_SECONDS"
+                continue
+              fi
+
+              if [ "$SYD_TOTAL_MINUTES" -gt "$WINDOW_END" ]; then
+                echo "Booking guard: already past 19:02 Sydney (current=${SYD_HOUR}:${SYD_MIN}). Proceeding immediately."
+                break
+              fi
+
+              echo "Booking guard: inside booking window (current=${SYD_HOUR}:${SYD_MIN} Sydney)."
+              break
+            done
+            echo "Booking guard: proceeding at $(TZ=Australia/Sydney date '+%Y-%m-%d %H:%M:%S %Z')."
+          else
+            echo "Booking guard: manual run; skipping Sydney-time wait."
           fi
           echo "=== Chrome versions ==="
           google-chrome --version || true

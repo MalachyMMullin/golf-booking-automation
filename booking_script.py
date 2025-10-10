@@ -79,7 +79,7 @@ TEE_SHEET_WAIT_MAX_SEC = 90
 BOOKING_VERIFY_TIMEOUT_SEC = 30
 BOOKING_VERIFY_POLL_INTERVAL_SEC = 1.5
 JOB_MAX_RUNTIME_SEC = 2700  # hard cap on total job runtime (45 minutes)
-UNLOCK_WAIT_BOOKING_SEC = 900  # max wait for bookings to open during booking flows (15 min)
+UNLOCK_WAIT_BOOKING_SEC = 1800  # max wait for bookings to open during booking flows (30 min)
 UNLOCK_WAIT_VERIFY_SEC = 60  # max wait during verification (1 min)
 
 # Logging/snapshot paths
@@ -161,6 +161,10 @@ def compute_target_date() -> Tuple[datetime, datetime, datetime, str, str]:
 
 local_now, upcoming_thursday, target_date, target_day_name, target_date_combo = compute_target_date()
 log("--- RUNNING IN LIVE AUTOMATIC MODE ---")
+try:
+    log(f"Local time at script start: {local_now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+except Exception:  # strftime may fail on some platforms; fallback to ISO format
+    log(f"Local time at script start: {local_now.isoformat()}")
 log(f"The next booking Thursday is: {upcoming_thursday.strftime('%Y-%m-%d')}")
 log(
     "Therefore, the script is targeting Saturday: "
