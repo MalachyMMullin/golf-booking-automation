@@ -111,7 +111,7 @@ jobs:
         with:
           name: run-artifacts
           path: |
-            $HOME/golfbot_logs/**
+            ${{ env.HOME }}/golfbot_logs/**
             logs/**
             evidence/**
             **/*.html
