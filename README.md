@@ -58,6 +58,9 @@ workflows provided in [`.github/workflows`](.github/workflows).
    - **Weekly golf booking (Sydney 7 pm Thu):** production workflow that runs
      `booking_script.py` on the scheduled Thursday evening cron as well as on
      demand via the **Run workflow** button.
+   - **Friday golf booking (Sydney 7 pm):** companion workflow that targets the
+     Sunday tee sheet by running `booking_script_sunday.py` from the Friday
+     evening cron (07:40/08:40 UTC) or via manual dispatch.
    - **Manual Thursday booking test:** ad-hoc workflow that runs only when
      manually triggered and executes `booking_script_thursday.py`. It accepts a
      `really_book` toggle (defaults to `false`) so you can run dry tests, and a
