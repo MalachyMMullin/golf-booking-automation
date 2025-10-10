@@ -111,6 +111,7 @@ jobs:
         with:
           name: run-artifacts
           path: |
+            $HOME/golfbot_logs/**
             logs/**
             evidence/**
             **/*.html

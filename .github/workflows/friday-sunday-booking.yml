@@ -110,6 +110,7 @@ jobs:
         with:
           name: sunday-run-artifacts
           path: |
+            $HOME/golfbot_logs/**
             logs/**
             evidence/**
             **/*.html

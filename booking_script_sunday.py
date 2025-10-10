@@ -9,6 +9,7 @@ headless, scheduled environment such as PythonAnywhere.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -70,6 +71,8 @@ PLAYERS_TO_VERIFY = [
 
 
 OPEN_POLL_INTERVAL_SEC = 2
+QUEUE_POLL_INTERVAL_SEC = 3
+QUEUE_TIMEOUT_EXTENSION_SEC = 30
 YES_BUTTON_WAIT_BASE_SEC = 20  # modal wait starts at 20s and expands each retry
 YES_BUTTON_WAIT_STEP_SEC = 5
 YES_BUTTON_WAIT_MAX_SEC = 40
@@ -237,11 +240,40 @@ def _wait_ready_state_complete(driver: webdriver.Chrome, timeout: int = 30) -> b
     return False
 
 
+def _detect_queue_status(driver: webdriver.Chrome) -> Tuple[bool, str, int | None]:
+    """Detect the MiClub queue banner if present."""
+
+    try:
+        banner = driver.find_element(
+            By.XPATH,
+            "//div[contains(., 'Current Position') and contains(., 'queue')]",
+        )
+        text = banner.text.strip()
+        match = re.search(r"Current Position\s*:\s*(\d+)", text)
+        position = int(match.group(1)) if match else None
+        return True, text, position
+    except Exception:
+        pass
+
+    try:
+        banner = driver.find_element(
+            By.XPATH,
+            "//div[contains(@class,'queue') or contains(., 'placed in a queue')]",
+        )
+        text = banner.text.strip()
+        match = re.search(r"Current Position\s*:\s*(\d+)", text)
+        position = int(match.group(1)) if match else None
+        return True, text, position
+    except Exception:
+        return False, "", None
+
+
 def _wait_teetime_table(driver: webdriver.Chrome, timeout: int) -> bool:
     _wait_ready_state_complete(driver, timeout=min(10, timeout))
-    end = time.time() + timeout
+    deadline = time.time() + timeout
     last_err: Exception | None = None
-    while time.time() < end:
+    last_queue_log = 0.0
+    while time.time() < deadline:
         try:
             table = driver.find_element(By.CLASS_NAME, "teetime-day-table")
             rows = table.find_elements(By.XPATH, ".//div[contains(@class, 'row-time')]")
@@ -249,6 +281,20 @@ def _wait_teetime_table(driver: webdriver.Chrome, timeout: int) -> bool:
                 return True
         except Exception as exc:  # noqa: BLE001 - we retry until timeout
             last_err = exc
+
+        queue_active, queue_text, queue_position = _detect_queue_status(driver)
+        if queue_active:
+            now = time.time()
+            if now - last_queue_log > 5:
+                pos_msg = f"position={queue_position}" if queue_position is not None else "position unknown"
+                log(f" -> Queue detected ({pos_msg}). Waiting before re-checking.")
+                if queue_text:
+                    log(f"    Queue banner: {queue_text.replace(os.linesep, ' | ')}")
+                last_queue_log = now
+            deadline = max(deadline, time.time() + QUEUE_TIMEOUT_EXTENSION_SEC)
+            time.sleep(QUEUE_POLL_INTERVAL_SEC)
+            continue
+
         time.sleep(0.25)
     log(f" -> TIMEOUT waiting for tee sheet (no rows). Last error: {last_err}")
     return False
@@ -356,6 +402,51 @@ def _wait_row_booked(
         except Exception:
             pass
         time.sleep(BOOKING_VERIFY_POLL_INTERVAL_SEC)
+    return False
+
+
+def _sheet_contains_expected_names(
+    driver: webdriver.Chrome, expected_names: List[str]
+) -> bool:
+    """Check the entire tee sheet text for expected player surnames."""
+
+    try:
+        table = driver.find_element(By.CLASS_NAME, "teetime-day-table")
+    except Exception:
+        return False
+
+    expected_surnames = {
+        name.split(",")[0].strip().lower() for name in expected_names if "," in name
+    }
+    expected_surnames.update(name.lower() for name in expected_names if "," not in name)
+
+    sheet_text = table.text.lower()
+    if expected_surnames:
+        return all(surname in sheet_text for surname in expected_surnames)
+
+    try:
+        return bool(table.find_elements(By.CLASS_NAME, "my-booking"))
+    except Exception:
+        return False
+
+
+def _verify_booking_via_refresh(
+    driver: webdriver.Chrome, expected_names: List[str], wait_timeout: int = 75
+) -> bool:
+    """Refresh the tee sheet and re-check for expected players as a fallback."""
+
+    try:
+        log("Attempting fallback verification by refreshing tee sheet.")
+        driver.refresh()
+        if not _wait_teetime_table(driver, timeout=wait_timeout):
+            log("Fallback verification: tee sheet did not load after refresh.")
+            return False
+        if _sheet_contains_expected_names(driver, expected_names):
+            log("Fallback verification succeeded; tee sheet shows expected playing partners.")
+            return True
+        log("Fallback verification: expected names still not visible after refresh.")
+    except Exception as exc:  # noqa: BLE001 - capture but do not raise
+        log(f"Fallback verification encountered an error: {exc}")
     return False
 
 
@@ -549,10 +640,22 @@ def execute_group_booking(
                     verified = _wait_row_booked(driver, row_dom_id, expected_names)
                     if verified:
                         log("Confirmed tee sheet now shows expected playing partners.")
+                    else:
+                        if _sheet_contains_expected_names(driver, expected_names):
+                            log(
+                                "Initial row check failed, but tee sheet text already shows expected playing partners."
+                            )
+                            verified = True
+                        elif _verify_booking_via_refresh(driver, expected_names):
+                            verified = True
                 else:
                     verified = _wait_row_booked(driver, row_dom_id, [])
                     if verified:
                         log("Confirmed tee sheet updated with booking for current user.")
+                    else:
+                        if _verify_booking_via_refresh(driver, []):
+                            verified = True
+                            log("Fallback verification detected booking for current user.")
 
                 if not verified:
                     log(
