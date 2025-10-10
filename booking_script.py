@@ -793,8 +793,8 @@ def main() -> None:
             # Job-wide timeout check before proceeding to Group 2
             if time.time() - job_start_time > JOB_MAX_RUNTIME_SEC:
                 log("JOB TIMEOUT REACHED before Group 2. Aborting remaining flows.")
-            elif group1_success:
-                log("\n===== STARTING BOOKING FOR GROUP 2 (only because G1 succeeded) =====")
+            else:
+                log("\n===== STARTING BOOKING FOR GROUP 2 =====")
                 time.sleep(5)
                 if login(driver, BOOKER_2_USERNAME, BOOKER_2_PASSWORD):
                     if navigate_and_wait_for_unlock(driver, max_wait_seconds=UNLOCK_WAIT_BOOKING_SEC):
@@ -805,14 +805,12 @@ def main() -> None:
                             GROUP_2_MAX_ATTEMPTS,
                         )
                         logout(driver)
-            else:
-                log("\n[INFO] Skipping Group 2 (Group 1 did not succeed).")
 
             # Job-wide timeout check before proceeding to Group 3
             if time.time() - job_start_time > JOB_MAX_RUNTIME_SEC:
                 log("JOB TIMEOUT REACHED before Group 3. Aborting remaining flows.")
-            elif not group1_success:
-                log("\n===== STARTING BOOKING FOR GROUP 3 (BACKUP because G1 failed) =====")
+            elif not (group1_success and group2_success):
+                log("\n===== STARTING BOOKING FOR GROUP 3 (BACKUP because a primary group failed) =====")
                 time.sleep(5)
                 if login(driver, BOOKER_3_USERNAME, BOOKER_3_PASSWORD):
                     if navigate_and_wait_for_unlock(driver, max_wait_seconds=UNLOCK_WAIT_BOOKING_SEC):
@@ -824,7 +822,7 @@ def main() -> None:
                         )
                         logout(driver)
             else:
-                log("\n[INFO] Skipping Group 3 (backup not needed because G1 succeeded).")
+                log("\n[INFO] Skipping Group 3 (backup not needed because Groups 1 and 2 succeeded).")
 
             # Job-wide timeout check before verification
             if time.time() - job_start_time > JOB_MAX_RUNTIME_SEC:
