@@ -85,6 +85,27 @@ JOB_MAX_RUNTIME_SEC = 2700  # hard cap on total job runtime (45 minutes)
 UNLOCK_WAIT_BOOKING_SEC = 1800  # max wait for bookings to open during booking flows (30 min)
 UNLOCK_WAIT_VERIFY_SEC = 60  # max wait during verification (1 min)
 
+# Waitlist/queue probing (allows entering the MiClub waiting room before the sheet opens)
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+WAITLIST_PROBE_ENABLED = _env_flag("WAITLIST_PROBE_ENABLED", True)
+WAITLIST_PROBE_INTERVAL_SEC = max(3, _env_int("WAITLIST_PROBE_INTERVAL_SEC", 3))
+
 # Logging/snapshot paths
 RUN_ROOT = Path.home() / "golfbot_logs"
 RUN_ROOT.mkdir(exist_ok=True)
@@ -267,6 +288,49 @@ def _detect_queue_status(driver: webdriver.Chrome) -> Tuple[bool, str, int | Non
         return True, text, position
     except Exception:
         return False, "", None
+
+
+def _has_tee_sheet(driver: webdriver.Chrome) -> bool:
+    """Return True if the tee-sheet table (with rows) is present."""
+
+    try:
+        table = driver.find_element(By.CLASS_NAME, "teetime-day-table")
+        rows = table.find_elements(By.XPATH, ".//div[contains(@class, 'row-time')]")
+        return bool(rows)
+    except Exception:
+        return False
+
+
+def _attempt_waitlist_probe(driver: webdriver.Chrome, event_url: str) -> str:
+    """
+    Navigate directly to the event page to engage the MiClub waitlist/queue.
+
+    Returns:
+        "queue" if the waitlist banner is detected and we should remain on the page.
+        "open" if the tee sheet is already accessible.
+        "locked" if bookings are still closed with no queue.
+        "error" if navigation failed.
+    """
+
+    try:
+        log("Waitlist probe: attempting to reach event page ahead of unlock.")
+        driver.get(event_url)
+        _wait_ready_state_complete(driver, timeout=8)
+        queue_active, queue_text, queue_position = _detect_queue_status(driver)
+        if queue_active:
+            pos_msg = queue_position if queue_position is not None else "unknown"
+            log(f"Waitlist probe: queue banner detected (position={pos_msg}). Holding position.")
+            if queue_text:
+                log(f"    Queue banner: {queue_text.replace(os.linesep, ' | ')}")
+            return "queue"
+        if _has_tee_sheet(driver):
+            log("Waitlist probe: tee sheet already available; proceeding immediately.")
+            return "open"
+        log("Waitlist probe: event still locked and no queue yet.")
+        return "locked"
+    except Exception as exc:  # noqa: BLE001 - best-effort probing
+        log(f"Waitlist probe encountered an error: {exc}")
+        return "error"
 
 
 def _wait_teetime_table(driver: webdriver.Chrome, timeout: int) -> bool:
@@ -493,6 +557,7 @@ def navigate_and_wait_for_unlock(
     log("Navigating to event list and waiting for bookings to open...")
     driver.get(EVENT_LIST_URL)
     deadline = time.time() + max_wait_seconds
+    last_waitlist_probe = 0.0
     while time.time() < deadline:
         try:
             event_div_xpath = (
@@ -504,6 +569,9 @@ def navigate_and_wait_for_unlock(
                 EC.presence_of_element_located((By.XPATH, event_div_xpath))
             )
             link = target_event_div.find_element(By.TAG_NAME, "a")
+            event_url = link.get_attribute("href") or ""
+            if event_url.lower().startswith("javascript"):
+                event_url = ""
             classes = link.get_attribute("class") or ""
             if "eventStatusOpen" in classes:
                 log(f"SUCCESS! {target_date_combo} is now OPEN. Clicking it!")
@@ -513,6 +581,24 @@ def navigate_and_wait_for_unlock(
                 except ElementClickInterceptedException:
                     driver.execute_script("arguments[0].click();", link)
                 return True
+
+            now = time.time()
+            if (
+                WAITLIST_PROBE_ENABLED
+                and event_url
+                and now - last_waitlist_probe >= WAITLIST_PROBE_INTERVAL_SEC
+            ):
+                last_waitlist_probe = now
+                outcome = _attempt_waitlist_probe(driver, event_url)
+                if outcome == "queue":
+                    log("Waitlist probe: staying on queue page until tee sheet releases.")
+                    return True
+                if outcome == "open":
+                    log("Waitlist probe: tee sheet already accessible; proceeding.")
+                    return True
+                log("Waitlist probe did not enter queue; returning to event list.")
+                driver.get(EVENT_LIST_URL)
+                continue
             log(
                 f"Status check: {target_date_combo} is still LOCKED. "
                 f"Refreshing in {OPEN_POLL_INTERVAL_SEC} seconds..."

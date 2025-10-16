@@ -2,10 +2,10 @@ name: Weekly golf booking (Sydney 7 pm Thu)
 
 on:
   schedule:
-    # Run at 07:40 UTC and 08:40 UTC every Thursday
-    # (starts early so the job is live before the 19:00 Sydney unlock even with cron lag)
-    - cron: "40 7 * * 4"
-    - cron: "40 8 * * 4"
+    # Run at 07:30 UTC and 08:30 UTC every Thursday
+    # (keeps the job live well before the 19:00 Sydney unlock even with cron lag)
+    - cron: "30 7 * * 4"
+    - cron: "30 8 * * 4"
   workflow_dispatch: {}  # allows manual run
 
 jobs:
@@ -61,9 +61,9 @@ jobs:
           PYTHONUNBUFFERED: "1"       # <-- live logs
         run: |
           set -euo pipefail
-          # Guard scheduled runs so we only proceed when it is ~18:59 Australia/Sydney
+          # Guard scheduled runs so we only proceed when it is ~18:40 Australia/Sydney
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            WINDOW_START=$((18 * 60 + 58))
+            WINDOW_START=$((18 * 60 + 40))
             WINDOW_END=$((19 * 60 + 2))
             while true; do
               SYD_HOUR=$(TZ=Australia/Sydney date +%H)
@@ -81,7 +81,7 @@ jobs:
                 if [ "$SLEEP_SECONDS" -le 0 ]; then
                   SLEEP_SECONDS=30
                 fi
-                echo "Booking guard: ${SYD_HOUR}:${SYD_MIN} Sydney. Sleeping ${SLEEP_SECONDS}s until 18:58."
+                echo "Booking guard: ${SYD_HOUR}:${SYD_MIN} Sydney. Sleeping ${SLEEP_SECONDS}s until 18:40."
                 sleep "$SLEEP_SECONDS"
                 continue
               fi
