@@ -86,8 +86,9 @@ UNLOCK_WAIT_BOOKING_SEC = 1800  # max wait for bookings to open during booking f
 UNLOCK_WAIT_VERIFY_SEC = 60  # max wait during verification (1 min)
 
 # Logging/snapshot paths
-RUN_ROOT = Path.home() / "golfbot_logs"
-RUN_ROOT.mkdir(exist_ok=True)
+RUN_ROOT_ENV = os.getenv("GOLFBOT_RUN_ROOT")
+RUN_ROOT = Path(RUN_ROOT_ENV).expanduser() if RUN_ROOT_ENV else Path.home() / "golfbot_logs"
+RUN_ROOT.mkdir(parents=True, exist_ok=True)
 RUN_ID = datetime.now().strftime("run_%Y-%m-%d_%H-%M-%S")
 RUN_DIR = RUN_ROOT / RUN_ID
 RUN_DIR.mkdir(parents=True, exist_ok=True)

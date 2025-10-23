@@ -83,8 +83,9 @@ TEE_SHEET_WAIT_FIRST = 120  # after 19:00 rush
 TEE_SHEET_WAIT_SUBSEQUENT = 60
 
 # Logging/snapshot paths
-RUN_ROOT = Path.home() / "golfbot_logs"
-RUN_ROOT.mkdir(exist_ok=True)
+RUN_ROOT_ENV = os.getenv("GOLFBOT_RUN_ROOT")
+RUN_ROOT = Path(RUN_ROOT_ENV).expanduser() if RUN_ROOT_ENV else Path.home() / "golfbot_logs"
+RUN_ROOT.mkdir(parents=True, exist_ok=True)
 RUN_ID = datetime.now().strftime("run_%Y-%m-%d_%H-%M-%S")
 RUN_DIR = RUN_ROOT / RUN_ID
 RUN_DIR.mkdir(parents=True, exist_ok=True)

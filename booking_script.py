@@ -72,14 +72,14 @@ PLAYERS_TO_VERIFY = [
 
 OPEN_POLL_INTERVAL_SEC = 2
 QUEUE_POLL_INTERVAL_SEC = 3
-QUEUE_TIMEOUT_EXTENSION_SEC = 30
+QUEUE_TIMEOUT_EXTENSION_SEC = 120
 YES_BUTTON_WAIT_BASE_SEC = 20  # modal wait starts at 20s and expands each retry
 YES_BUTTON_WAIT_STEP_SEC = 5
 YES_BUTTON_WAIT_MAX_SEC = 40
 TEE_SHEET_WAIT_INITIAL_SEC = 30  # tee-sheet wait grows by 15s per attempt up to 90s
 TEE_SHEET_WAIT_STEP_SEC = 15
 TEE_SHEET_WAIT_MAX_SEC = 90
-BOOKING_VERIFY_TIMEOUT_SEC = 30
+BOOKING_VERIFY_TIMEOUT_SEC = 60
 BOOKING_VERIFY_POLL_INTERVAL_SEC = 1.5
 JOB_MAX_RUNTIME_SEC = 2700  # hard cap on total job runtime (45 minutes)
 UNLOCK_WAIT_BOOKING_SEC = 1800  # max wait for bookings to open during booking flows (30 min)
@@ -107,8 +107,9 @@ WAITLIST_PROBE_ENABLED = _env_flag("WAITLIST_PROBE_ENABLED", True)
 WAITLIST_PROBE_INTERVAL_SEC = max(3, _env_int("WAITLIST_PROBE_INTERVAL_SEC", 3))
 
 # Logging/snapshot paths
-RUN_ROOT = Path.home() / "golfbot_logs"
-RUN_ROOT.mkdir(exist_ok=True)
+RUN_ROOT_ENV = os.getenv("GOLFBOT_RUN_ROOT")
+RUN_ROOT = Path(RUN_ROOT_ENV).expanduser() if RUN_ROOT_ENV else Path.home() / "golfbot_logs"
+RUN_ROOT.mkdir(parents=True, exist_ok=True)
 RUN_ID = datetime.now().strftime("run_%Y-%m-%d_%H-%M-%S")
 RUN_DIR = RUN_ROOT / RUN_ID
 RUN_DIR.mkdir(parents=True, exist_ok=True)
@@ -498,20 +499,31 @@ def _sheet_contains_expected_names(
 
 
 def _verify_booking_via_refresh(
-    driver: webdriver.Chrome, expected_names: List[str], wait_timeout: int = 75
+    driver: webdriver.Chrome, expected_names: List[str], wait_timeout: int = 120
 ) -> bool:
-    """Refresh the tee sheet and re-check for expected players as a fallback."""
+    """Wait for the tee sheet to reappear and re-check for expected players."""
 
     try:
-        log("Attempting fallback verification by refreshing tee sheet.")
-        driver.refresh()
+        log("Attempting fallback verification by waiting for tee sheet to stabilise.")
+        queue_active, queue_text, queue_position = _detect_queue_status(driver)
+        if queue_active:
+            pos_msg = queue_position if queue_position is not None else "unknown"
+            log(
+                "Fallback verification: queue detected (position="
+                f"{pos_msg}). Holding position without refreshing."
+            )
+            if queue_text:
+                log(f"    Queue banner: {queue_text.replace(os.linesep, ' | ')}")
+
         if not _wait_teetime_table(driver, timeout=wait_timeout):
-            log("Fallback verification: tee sheet did not load after refresh.")
+            log("Fallback verification: tee sheet did not become available in time.")
             return False
+
         if _sheet_contains_expected_names(driver, expected_names):
             log("Fallback verification succeeded; tee sheet shows expected playing partners.")
             return True
-        log("Fallback verification: expected names still not visible after refresh.")
+
+        log("Fallback verification: expected names still not visible after waiting.")
     except Exception as exc:  # noqa: BLE001 - capture but do not raise
         log(f"Fallback verification encountered an error: {exc}")
     return False

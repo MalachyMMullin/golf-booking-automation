@@ -18,6 +18,7 @@ jobs:
     env:
       TZ: Australia/Sydney
       HEADLESS: "true"
+      GOLFBOT_RUN_ROOT: ${{ github.workspace }}/golfbot_logs
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -61,10 +62,10 @@ jobs:
           PYTHONUNBUFFERED: "1"       # <-- live logs
         run: |
           set -euo pipefail
-          # Guard scheduled runs so we only proceed when it is ~18:40 Australia/Sydney
+          # Guard scheduled runs so we only proceed when it is ~18:30 Australia/Sydney
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            WINDOW_START=$((18 * 60 + 40))
-            WINDOW_END=$((19 * 60 + 2))
+            WINDOW_START=$((18 * 60 + 28))
+            WINDOW_END=$((19 * 60 + 5))
             while true; do
               SYD_HOUR=$(TZ=Australia/Sydney date +%H)
               SYD_MIN=$(TZ=Australia/Sydney date +%M)
@@ -81,7 +82,7 @@ jobs:
                 if [ "$SLEEP_SECONDS" -le 0 ]; then
                   SLEEP_SECONDS=30
                 fi
-                echo "Booking guard: ${SYD_HOUR}:${SYD_MIN} Sydney. Sleeping ${SLEEP_SECONDS}s until 18:40."
+                echo "Booking guard: ${SYD_HOUR}:${SYD_MIN} Sydney. Sleeping ${SLEEP_SECONDS}s until 18:28."
                 sleep "$SLEEP_SECONDS"
                 continue
               fi
@@ -111,9 +112,5 @@ jobs:
         with:
           name: run-artifacts
           path: |
-            ${{ env.HOME }}/golfbot_logs/**
-            logs/**
-            evidence/**
-            **/*.html
-            **/*.png
+            golfbot_logs/**
           if-no-files-found: ignore
