@@ -1,19 +1,20 @@
-name: Weekly golf booking (Sydney 7 pm Thu)
+name: Thursday golf booking (Sydney 6 pm queue)
 
 on:
   schedule:
-    # Run at 07:30 UTC and 08:30 UTC every Thursday
-    # (keeps the job live well before the 19:00 Sydney unlock even with cron lag)
-    - cron: "30 7 * * 4"
-    - cron: "30 8 * * 4"
+    # Run at 07:00 UTC and 07:10 UTC every Thursday (18:00/18:10 AEDT, 17:00/17:10 AEST).
+    # The Python scripts themselves hold until the 18:29 queue, so starting in this window
+    # keeps both DST and Standard Time covered while still maintaining queue position.
+    - cron: "0 7 * * 4"
+    - cron: "10 7 * * 4"
   workflow_dispatch: {}  # allows manual run
 
 jobs:
   book:
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 120
     concurrency:
-      group: golf-booking
+      group: golf-booking-thursday
       cancel-in-progress: false
     env:
       TZ: Australia/Sydney
@@ -62,10 +63,9 @@ jobs:
           PYTHONUNBUFFERED: "1"       # <-- live logs
         run: |
           set -euo pipefail
-          # Guard scheduled runs so we only proceed when it is ~18:30 Australia/Sydney
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            WINDOW_START=$((18 * 60 + 28))
-            WINDOW_END=$((19 * 60 + 5))
+            WINDOW_START=$((18 * 60))
+            WINDOW_END=$((18 * 60 + 15))
             while true; do
               SYD_HOUR=$(TZ=Australia/Sydney date +%H)
               SYD_MIN=$(TZ=Australia/Sydney date +%M)
@@ -73,7 +73,6 @@ jobs:
 
               if [ "$SYD_TOTAL_MINUTES" -lt "$WINDOW_START" ]; then
                 REMAIN_MINUTES=$((WINDOW_START - SYD_TOTAL_MINUTES))
-                # Sleep in shorter chunks (max 5 minutes) so logs stay active.
                 if [ "$REMAIN_MINUTES" -gt 5 ]; then
                   SLEEP_SECONDS=$((5 * 60))
                 else
@@ -82,29 +81,50 @@ jobs:
                 if [ "$SLEEP_SECONDS" -le 0 ]; then
                   SLEEP_SECONDS=30
                 fi
-                echo "Booking guard: ${SYD_HOUR}:${SYD_MIN} Sydney. Sleeping ${SLEEP_SECONDS}s until 18:28."
+                echo "Login guard: ${SYD_HOUR}:${SYD_MIN} Sydney. Sleeping ${SLEEP_SECONDS}s until 18:00."
                 sleep "$SLEEP_SECONDS"
                 continue
               fi
 
               if [ "$SYD_TOTAL_MINUTES" -gt "$WINDOW_END" ]; then
-                echo "Booking guard: already past 19:02 Sydney (current=${SYD_HOUR}:${SYD_MIN}). Proceeding immediately."
+                echo "Login guard: already past 18:15 Sydney (current=${SYD_HOUR}:${SYD_MIN}). Proceeding immediately."
                 break
               fi
 
-              echo "Booking guard: inside booking window (current=${SYD_HOUR}:${SYD_MIN} Sydney)."
+              echo "Login guard: inside login window (current=${SYD_HOUR}:${SYD_MIN} Sydney)."
               break
             done
-            echo "Booking guard: proceeding at $(TZ=Australia/Sydney date '+%Y-%m-%d %H:%M:%S %Z')."
+            echo "Login guard: proceeding at $(TZ=Australia/Sydney date '+%Y-%m-%d %H:%M:%S %Z')."
           else
-            echo "Booking guard: manual run; skipping Sydney-time wait."
+            echo "Login guard: manual run; skipping Sydney-time wait."
           fi
+
           echo "=== Chrome versions ==="
           google-chrome --version || true
           chromedriver --version || true
-          echo "=== Starting booking_script.py ==="
-          python -u booking_script.py --really-book
-          echo "=== Script finished ==="
+
+          echo "=== Launching Thursday scripts in parallel ==="
+          python -u booking_script_thursday.py &
+          PID_G1=$!
+          python -u booking_script_thursday_group2.py &
+          PID_G2=$!
+
+          set +e
+          wait "$PID_G1"
+          STATUS_G1=$?
+          wait "$PID_G2"
+          STATUS_G2=$?
+          set -e
+
+          echo "Group 1 script exit code: $STATUS_G1"
+          echo "Group 2 script exit code: $STATUS_G2"
+
+          if [ "$STATUS_G1" -ne 0 ] || [ "$STATUS_G2" -ne 0 ]; then
+            echo "At least one Thursday booking script failed."
+            exit 1
+          fi
+
+          echo "=== Both Thursday scripts finished successfully ==="
 
       - name: Upload run logs (optional)
         if: always()
