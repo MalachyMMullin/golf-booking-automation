@@ -1,11 +1,7 @@
 name: Friday golf booking (Sydney 7 pm)
 
 on:
-  schedule:
-    # Run at 07:40 UTC and 08:40 UTC every Friday
-    # (starts early so the job is live before the 19:00 Sydney unlock even with cron lag)
-    - cron: "40 7 * * 5"
-    - cron: "40 8 * * 5"
+  # Disabled automatic schedule – manual trigger only.
   workflow_dispatch: {}  # allows manual run
 
 jobs:
