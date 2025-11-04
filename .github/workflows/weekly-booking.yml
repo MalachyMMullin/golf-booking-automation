@@ -2,11 +2,11 @@ name: Thursday golf booking (Sydney 6 pm queue)
 
 on:
   schedule:
-    # Run at 07:00 UTC and 07:10 UTC every Thursday (18:00/18:10 AEDT, 17:00/17:10 AEST).
-    # The Python scripts themselves hold until the 18:29 queue, so starting in this window
-    # keeps both DST and Standard Time covered while still maintaining queue position.
-    - cron: "0 7 * * 4"
-    - cron: "10 7 * * 4"
+    # Start well before the 18:00 Sydney login gate so the workflow is alive when the queue unlocks.
+    # 05:30 and 06:00 UTC cover both AEDT (UTC+11) and AEST (UTC+10) while keeping the job
+    # running comfortably before 6 pm local. The Python scripts themselves wait until 18:00/18:30/19:00.
+    - cron: "30 5 * * 4"
+    - cron: "0 6 * * 4"
   workflow_dispatch: {}  # allows manual run
 
 jobs:

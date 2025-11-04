@@ -89,7 +89,8 @@ TEE_SHEET_WAIT_SUBSEQUENT = 60
 
 SYDNEY_TZ = zoneinfo.ZoneInfo("Australia/Sydney") if zoneinfo else timezone.utc
 QUEUE_LOGIN_TIME = (18, 0)  # 6:00pm Sydney
-QUEUE_JOIN_TIME = (18, 29)  # 6:29pm Sydney (queue opens ~6:30)
+QUEUE_JOIN_TIME = (18, 30)  # 6:30pm Sydney queue unlock
+BOOKING_OPEN_TIME = (19, 0)  # 7:00pm Sydney booking release
 
 # Logging/snapshot paths
 RUN_ROOT_ENV = os.getenv("GOLFBOT_RUN_ROOT")
@@ -186,7 +187,7 @@ def wait_until_local_time(target_hour: int, target_minute: int, label: str) -> N
 
 
 def hold_event_list_until_queue(driver: webdriver.Chrome) -> None:
-    """Stay on the event list, refreshing periodically until 18:29 Sydney time."""
+    """Stay on the event list, refreshing periodically until 18:30 Sydney time."""
 
     local_now = now_in_sydney()
     target = local_now.replace(
@@ -219,7 +220,9 @@ def hold_event_list_until_queue(driver: webdriver.Chrome) -> None:
         elif seconds_left > 60:
             sleep_for = 30
         else:
-            sleep_for = max(5, seconds_left)
+            # wake slightly before the unlock so we can refresh promptly
+            sleep_for = max(5, seconds_left - 5)
+            sleep_for = min(sleep_for, seconds_left)
         log(
             f"Queue wait: {seconds_left/60:.1f} min remaining until "
             f"{target:%H:%M %Z} (sleeping {int(sleep_for)}s)."
@@ -231,6 +234,16 @@ def hold_event_list_until_queue(driver: webdriver.Chrome) -> None:
         except Exception as exc:  # noqa: BLE001 - keep waiting despite refresh issues
             log(f"WARNING: Refresh while waiting for queue failed: {exc}")
             time.sleep(5)
+
+
+def hold_until_booking_release(label: str = "Booking release gate (7:00pm Sydney)") -> None:
+    """Block until the 19:00 release window, logging progress."""
+
+    wait_until_local_time(
+        BOOKING_OPEN_TIME[0],
+        BOOKING_OPEN_TIME[1],
+        label,
+    )
 
 
 def zip_run_folder() -> None:
@@ -726,6 +739,7 @@ def main() -> None:
             if login(driver, BOOKER_1_USERNAME, BOOKER_1_PASSWORD):
                 hold_event_list_until_queue(driver)
                 if navigate_and_wait_for_unlock(driver):
+                    hold_until_booking_release()
                     group1_success = execute_group_booking(
                         driver,
                         BOOKER_1_USERNAME,
@@ -751,6 +765,9 @@ def main() -> None:
                 if login(driver, BOOKER_3_USERNAME, BOOKER_3_PASSWORD):
                     hold_event_list_until_queue(driver)
                     if navigate_and_wait_for_unlock(driver):
+                        hold_until_booking_release(
+                            "Booking release gate (7:00pm Sydney) prior to backup run"
+                        )
                         group3_success = execute_group_booking(
                             driver,
                             BOOKER_3_USERNAME,
