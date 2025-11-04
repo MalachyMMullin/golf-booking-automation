@@ -1,9 +1,8 @@
-"""Golf booking automation script for PythonAnywhere (Thursday variant).
+"""Golf booking automation script (Thursday variant, Group 2 only).
 
 This module provisions a Selenium-based job that monitors the Macquarie Links
-MiClub portal and attempts to reserve tee-times for pre-defined player groups.
-The code is intentionally verbose and defensive so that it can operate in a
-headless, scheduled environment such as PythonAnywhere.
+MiClub portal and attempts to reserve tee-times for Group 2 only, allowing it
+to run concurrently with a separate Group 1 script to maintain queue position.
 """
 
 from __future__ import annotations
@@ -36,32 +35,23 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-
 from selenium.webdriver.remote.webelement import WebElement
 
 
 # ------------------------------------------------------------------------------------
-# CONFIG
+# CONFIG (Thursday target, Group 2 only)
 # ------------------------------------------------------------------------------------
 LOGIN_URL = "https://macquarielinks.miclub.com.au/security/login.msp"
 EVENT_LIST_URL = "https://macquarielinks.miclub.com.au/views/members/booking/eventList.xhtml"
 LOGOUT_URL = "https://macquarielinks.miclub.com.au/security/logout.msp"
 
-BOOKER_1_USERNAME = os.getenv("MIGOLF_USER_1", "2007")
-BOOKER_1_PASSWORD = os.getenv("MIGOLF_PASS_1", "Golf123#")
-GROUP_1_SIZE = 4
-GROUP_1_MAX_ATTEMPTS = 60  # ~5 minutes
-
+# Group 2 credentials and sizing
 BOOKER_2_USERNAME = os.getenv("MIGOLF_USER_2", "1107")
 BOOKER_2_PASSWORD = os.getenv("MIGOLF_PASS_2", "Golf123#")
 GROUP_2_SIZE = 2
 GROUP_2_MAX_ATTEMPTS = 36  # ~3 minutes
 
-BOOKER_3_USERNAME = os.getenv("MIGOLF_USER_3", "2008")
-BOOKER_3_PASSWORD = os.getenv("MIGOLF_PASS_3", "Golf123#")
-GROUP_3_SIZE = 4
-GROUP_3_MAX_ATTEMPTS = 180  # ~15 minutes (backup)
-
+# Optional: players to verify on final tee sheet
 PLAYERS_TO_VERIFY = [
     "Mullin",
     "Hillard",
@@ -71,10 +61,9 @@ PLAYERS_TO_VERIFY = [
     "Cheney",
 ]
 
+# Expected name validation for confirmation modal.
 EXPECTED_GROUPS = {
-    "2007": ["Mullin", "Hillard", "Rutherford", "Rudge"],
     "1107": ["Cheney", "Lalor"],
-    # "2008": [...],  # add if you want modal validation for fallback too
 }
 
 
@@ -91,11 +80,11 @@ SYDNEY_TZ = zoneinfo.ZoneInfo("Australia/Sydney") if zoneinfo else timezone.utc
 QUEUE_LOGIN_TIME = (18, 0)  # 6:00pm Sydney
 QUEUE_JOIN_TIME = (18, 29)  # 6:29pm Sydney (queue opens ~6:30)
 
-# Logging/snapshot paths
+# Logging/snapshot paths (use a distinct suffix to avoid clashes when run concurrently)
 RUN_ROOT_ENV = os.getenv("GOLFBOT_RUN_ROOT")
 RUN_ROOT = Path(RUN_ROOT_ENV).expanduser() if RUN_ROOT_ENV else Path.home() / "golfbot_logs"
 RUN_ROOT.mkdir(parents=True, exist_ok=True)
-RUN_ID = datetime.now().strftime("run_%Y-%m-%d_%H-%M-%S")
+RUN_ID = datetime.now().strftime("run_%Y-%m-%d_%H-%M-%S_g2")
 RUN_DIR = RUN_ROOT / RUN_ID
 RUN_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = RUN_DIR / "run.log"
@@ -244,11 +233,12 @@ def zip_run_folder() -> None:
 
 
 # ------------------------------------------------------------------------------------
-# DATE/TARGET
+# DATE/TARGET (Thursday)
 # ------------------------------------------------------------------------------------
 def compute_target_date() -> Tuple[datetime, datetime, datetime, str, str]:
     local_now = now_in_sydney()
 
+    # Thursday = weekday 3
     days_until_thu = (3 - local_now.weekday() + 7) % 7
     next_thu_offset = days_until_thu if days_until_thu else 7
     next_thu = local_now + timedelta(days=next_thu_offset)
@@ -264,7 +254,7 @@ def compute_target_date() -> Tuple[datetime, datetime, datetime, str, str]:
 local_now, next_available_thursday, target_date, target_day_name, target_date_combo = (
     compute_target_date()
 )
-log("--- RUNNING IN LIVE AUTOMATIC MODE ---")
+log("--- RUNNING IN LIVE AUTOMATIC MODE (G2 only) ---")
 log(f"The next available Thursday is: {next_available_thursday.strftime('%Y-%m-%d')}")
 log(
     "Therefore, the script is targeting Thursday: "
@@ -284,8 +274,6 @@ def make_driver() -> webdriver.Chrome:
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--remote-debugging-pipe")
-    # If you ever install your own Chromium, point to it here:
-    # opts.binary_location = "/home/youruser/bin/chromium/chrome"
 
     driver_path = shutil.which("chromedriver")
     service = Service(executable_path=driver_path) if driver_path else Service()
@@ -604,19 +592,45 @@ def execute_group_booking(
 
                 log("Confirmation modal appeared and names validated. Clicking to finalise booking.")
                 try:
-                    yes_button.click()
-                except ElementClickInterceptedException:
-                    driver.execute_script("arguments[0].click();", yes_button)
-                log(f"SUCCESS: Booking command sent for {booker_username}'s group.")
-                snap_png(driver, f"attempt{attempt}_after_confirm_click")
-                return True
+                    try:
+                        yes_button.click()
+                    except ElementClickInterceptedException:
+                        driver.execute_script("arguments[0].click();", yes_button)
+                except Exception as exc:
+                    log(f"    -> Failed to click Yes/Confirm: {exc}")
+                    snap_png(driver, f"attempt{attempt}_yes_click_failed")
+                    driver.refresh()
+                    time.sleep(2)
+                    continue
 
-            log("    -> TIMEOUT waiting for confirm modal/alert. Refresh + retry...")
-            snap_png(driver, f"attempt{attempt}_timeout_waiting_modal")
-            snap_html(driver, f"attempt{attempt}_timeout_waiting_modal")
-            driver.refresh()
-            time.sleep(4)
-            continue
+                time.sleep(0.5)
+                booked_ok, alert_text = _safe_accept_alert(driver)
+                if booked_ok:
+                    log(f"Booking finalised (alert said): {alert_text}")
+                    snap_png(driver, f"attempt{attempt}_booked_alert")
+                    return True
+
+                try:
+                    text = driver.find_element(By.TAG_NAME, "body").text
+                except Exception:
+                    text = ""
+                if "Your booking has been made" in text or "Booking successful" in text:
+                    log("Booking finalised (page text suggests success).")
+                    snap_png(driver, f"attempt{attempt}_booked_page")
+                    return True
+
+                log("    -> Booking finalisation unclear. Refresh + retry...")
+                snap_png(driver, f"attempt{attempt}_book_unclear")
+                driver.refresh()
+                time.sleep(2)
+                continue
+
+            if which == "timeout":
+                log("    -> Timed out waiting for confirmation or alert; refreshing...")
+                snap_png(driver, f"attempt{attempt}_confirm_timeout")
+                driver.refresh()
+                time.sleep(3)
+                continue
 
         except UnexpectedAlertPresentException:
             _safe_accept_alert(driver)
@@ -700,7 +714,7 @@ def verify_all_bookings(driver: webdriver.Chrome, all_players: List[str]) -> Non
 
 
 def main() -> None:
-    log("--- Golf Booking Bot Initialized [v52 timed queue hold] ---")
+    log("--- Golf Booking Bot Initialized [Thursday, Group 2 timed queue] ---")
     wait_until_local_time(
         QUEUE_LOGIN_TIME[0],
         QUEUE_LOGIN_TIME[1],
@@ -717,62 +731,32 @@ def main() -> None:
             log(f"Pre-flight navigation failed: {exc}")
             raise
 
-        group1_success = False
         group2_success = False
-        group3_success = False
 
         try:
-            log("\n===== STARTING BOOKING FOR GROUP 1 =====")
-            if login(driver, BOOKER_1_USERNAME, BOOKER_1_PASSWORD):
+            log("\n===== STARTING BOOKING FOR GROUP 2 =====")
+            if login(driver, BOOKER_2_USERNAME, BOOKER_2_PASSWORD):
                 hold_event_list_until_queue(driver)
                 if navigate_and_wait_for_unlock(driver):
-                    group1_success = execute_group_booking(
+                    group2_success = execute_group_booking(
                         driver,
-                        BOOKER_1_USERNAME,
-                        GROUP_1_SIZE,
-                        GROUP_1_MAX_ATTEMPTS,
+                        BOOKER_2_USERNAME,
+                        GROUP_2_SIZE,
+                        GROUP_2_MAX_ATTEMPTS,
                     )
                     logout(driver)
 
-            if group1_success:
-                log(
-                    "\n[INFO] Skipping Group 2 booking within this script "
-                    "(handled by dedicated runner)."
-                )
-            else:
-                log(
-                    "\n[INFO] Group 1 did not succeed; Group 2 booking remains with the "
-                    "dedicated runner."
-                )
-
-            if not group1_success:
-                log("\n===== STARTING BOOKING FOR GROUP 3 (BACKUP because G1 failed) =====")
-                time.sleep(5)
-                if login(driver, BOOKER_3_USERNAME, BOOKER_3_PASSWORD):
-                    hold_event_list_until_queue(driver)
-                    if navigate_and_wait_for_unlock(driver):
-                        group3_success = execute_group_booking(
-                            driver,
-                            BOOKER_3_USERNAME,
-                            GROUP_3_SIZE,
-                            GROUP_3_MAX_ATTEMPTS,
-                        )
-                        logout(driver)
-            else:
-                log("\n[INFO] Skipping Group 3 (backup not needed because G1 succeeded).")
-
-            if group1_success or group2_success or group3_success:
-                if login(driver, BOOKER_1_USERNAME, BOOKER_1_PASSWORD):
+            if group2_success:
+                # Re-login to verify tee sheet. Any member context should work;
+                # use G2 account by default.
+                if login(driver, BOOKER_2_USERNAME, BOOKER_2_PASSWORD):
                     verify_all_bookings(driver, PLAYERS_TO_VERIFY)
                     logout(driver)
         finally:
             driver.quit()
             log("\n--- All booking tasks complete. Browser closed. ---")
             zip_run_folder()
-            log(
-                f"Summary: G1={group1_success}, G2={group2_success}, "
-                f"G3={group3_success}"
-            )
+            log(f"Summary: G2={group2_success}")
             log(f"Log file: {LOG_FILE}")
             log(f"Evidence ZIP: {ZIP_PATH}")
 
