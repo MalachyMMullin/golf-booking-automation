@@ -262,25 +262,28 @@ def zip_run_folder() -> None:
 def compute_target_date() -> Tuple[datetime, datetime, datetime, str, str]:
     local_now = now_in_sydney()
 
-    days_until_thu = (3 - local_now.weekday() + 7) % 7
-    next_thu_offset = days_until_thu if days_until_thu else 7
-    next_thu = local_now + timedelta(days=next_thu_offset)
-    target = next_thu
+    weekday = local_now.weekday()
+    days_until_upcoming_sat = (5 - weekday + 7) % 7
+    if days_until_upcoming_sat == 0:
+        days_until_upcoming_sat = 7  # always look at least one week ahead
+
+    upcoming_saturday = local_now + timedelta(days=days_until_upcoming_sat)
+    target = upcoming_saturday + timedelta(days=7)  # following Saturday (≈9 days ahead on Thu)
     dayname = target.strftime("%a")
     try:
         combo = target.strftime("%-d %b")
     except Exception:
         combo = target.strftime("%d %b").lstrip("0")
-    return local_now, next_thu, target, dayname, combo
+    return local_now, upcoming_saturday, target, dayname, combo
 
 
-local_now, next_available_thursday, target_date, target_day_name, target_date_combo = (
+local_now, upcoming_saturday, target_date, target_day_name, target_date_combo = (
     compute_target_date()
 )
 log("--- RUNNING IN LIVE AUTOMATIC MODE ---")
-log(f"The next available Thursday is: {next_available_thursday.strftime('%Y-%m-%d')}")
+log(f"The upcoming Saturday is: {upcoming_saturday.strftime('%Y-%m-%d')}")
 log(
-    "Therefore, the script is targeting Thursday: "
+    "Therefore, the script is targeting the following Saturday: "
     f"{target_date.strftime('%Y-%m-%d')} ({target_day_name} {target_date_combo})"
 )
 
