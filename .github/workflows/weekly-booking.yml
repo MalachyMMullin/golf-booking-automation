@@ -2,10 +2,10 @@ name: Thursday golf booking (Sydney 6 pm queue)
 
 on:
   schedule:
-    # Start ~30 minutes before the 18:00 Sydney login gate so setup completes in time.
-    # 06:30 UTC lines up with 17:30 AEDT (summer), 07:30 UTC with 17:30 AEST (winter).
-    - cron: "30 6 * * 4"
-    - cron: "30 7 * * 4"
+    # Start at 05:00 Sydney time every Thursday (06:00 UTC in AEDT, 07:00 UTC in AEST)
+    # so the runner is live an hour before queue polling begins.
+    - cron: "0 6 * * 4"
+    - cron: "0 7 * * 4"
   workflow_dispatch: {}  # allows manual run
 
 jobs:

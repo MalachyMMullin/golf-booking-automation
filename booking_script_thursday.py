@@ -88,7 +88,7 @@ TEE_SHEET_WAIT_FIRST = 120  # after 19:00 rush
 TEE_SHEET_WAIT_SUBSEQUENT = 60
 
 SYDNEY_TZ = zoneinfo.ZoneInfo("Australia/Sydney") if zoneinfo else timezone.utc
-QUEUE_LOGIN_TIME = (18, 0)  # 6:00pm Sydney
+QUEUE_ACCESS_START_TIME = (18, 0)  # 6:00pm Sydney – begin polling event list
 QUEUE_JOIN_TIME = (18, 30)  # 6:30pm Sydney queue unlock
 BOOKING_OPEN_TIME = (19, 0)  # 7:00pm Sydney booking release
 
@@ -186,32 +186,36 @@ def wait_until_local_time(target_hour: int, target_minute: int, label: str) -> N
         time.sleep(sleep_for)
 
 
-def hold_event_list_until_queue(driver: webdriver.Chrome) -> None:
-    """Stay on the event list, refreshing periodically until 18:30 Sydney time."""
+def hold_until_queue_poll_window(driver: webdriver.Chrome) -> None:
+    """Keep the session warm until the 18:00 Sydney queue polling window."""
 
     local_now = now_in_sydney()
     target = local_now.replace(
-        hour=QUEUE_JOIN_TIME[0], minute=QUEUE_JOIN_TIME[1], second=0, microsecond=0
+        hour=QUEUE_ACCESS_START_TIME[0],
+        minute=QUEUE_ACCESS_START_TIME[1],
+        second=0,
+        microsecond=0,
     )
     if local_now >= target:
         log(
-            f"Queue join window ({QUEUE_JOIN_TIME[0]:02d}:{QUEUE_JOIN_TIME[1]:02d}) "
-            "already reached. Proceeding immediately."
+            f"Queue polling window ({QUEUE_ACCESS_START_TIME[0]:02d}:{QUEUE_ACCESS_START_TIME[1]:02d}) "
+            "already open. Proceeding immediately."
         )
+        driver.get(EVENT_LIST_URL)
         return
 
     log(
         "Holding event list page until "
-        f"{QUEUE_JOIN_TIME[0]:02d}:{QUEUE_JOIN_TIME[1]:02d} {local_now.tzname() or 'local'} "
-        "before attempting to join the queue."
+        f"{QUEUE_ACCESS_START_TIME[0]:02d}:{QUEUE_ACCESS_START_TIME[1]:02d} {local_now.tzname() or 'local'} "
+        "before beginning queue polling."
     )
     driver.get(EVENT_LIST_URL)
     while True:
         local_now = now_in_sydney()
         if local_now >= target:
             log(
-                f"Queue join window reached at {local_now:%H:%M:%S %Z}. "
-                "Proceeding to queue navigation."
+                f"Queue polling window reached at {local_now:%H:%M:%S %Z}. "
+                "Starting queue navigation."
             )
             return
         seconds_left = (target - local_now).total_seconds()
@@ -475,6 +479,13 @@ def logout(driver: webdriver.Chrome) -> None:
 def navigate_and_wait_for_unlock(driver: webdriver.Chrome) -> bool:
     log("Navigating to event list and waiting for bookings to open...")
     driver.get(EVENT_LIST_URL)
+    queue_deadline = now_in_sydney().replace(
+        hour=QUEUE_JOIN_TIME[0],
+        minute=QUEUE_JOIN_TIME[1],
+        second=0,
+        microsecond=0,
+    )
+    deadline_notified = False
     while True:
         try:
             event_div_xpath = (
@@ -499,6 +510,14 @@ def navigate_and_wait_for_unlock(driver: webdriver.Chrome) -> bool:
                 f"Status check: {target_date_combo} is still LOCKED. "
                 f"Refreshing in {OPEN_POLL_INTERVAL_SEC} seconds..."
             )
+            if not deadline_notified:
+                local_now = now_in_sydney()
+                if local_now >= queue_deadline:
+                    log(
+                        "[INFO] Queue unlock target time reached, continuing rapid polling "
+                        "until access opens."
+                    )
+                    deadline_notified = True
             time.sleep(OPEN_POLL_INTERVAL_SEC)
             driver.refresh()
         except Exception as exc:  # noqa: BLE001 - wait/retry
@@ -716,12 +735,7 @@ def verify_all_bookings(driver: webdriver.Chrome, all_players: List[str]) -> Non
 
 
 def main() -> None:
-    log("--- Golf Booking Bot Initialized [v52 timed queue hold] ---")
-    wait_until_local_time(
-        QUEUE_LOGIN_TIME[0],
-        QUEUE_LOGIN_TIME[1],
-        "Login gate (6:00pm Sydney)",
-    )
+    log("--- Golf Booking Bot Initialized [v53 5pm login + staged queue] ---")
     driver = make_driver()
 
     try:
@@ -740,7 +754,7 @@ def main() -> None:
         try:
             log("\n===== STARTING BOOKING FOR GROUP 1 =====")
             if login(driver, BOOKER_1_USERNAME, BOOKER_1_PASSWORD):
-                hold_event_list_until_queue(driver)
+                hold_until_queue_poll_window(driver)
                 if navigate_and_wait_for_unlock(driver):
                     hold_until_booking_release()
                     group1_success = execute_group_booking(
@@ -766,7 +780,7 @@ def main() -> None:
                 log("\n===== STARTING BOOKING FOR GROUP 3 (BACKUP because G1 failed) =====")
                 time.sleep(5)
                 if login(driver, BOOKER_3_USERNAME, BOOKER_3_PASSWORD):
-                    hold_event_list_until_queue(driver)
+                    hold_until_queue_poll_window(driver)
                     if navigate_and_wait_for_unlock(driver):
                         hold_until_booking_release(
                             "Booking release gate (7:00pm Sydney) prior to backup run"
