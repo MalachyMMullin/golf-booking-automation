@@ -5,7 +5,6 @@ on:
     # Start at 05:00 Sydney time every Thursday (06:00 UTC in AEDT, 07:00 UTC in AEST)
     # so the runner is live an hour before queue polling begins.
     - cron: "0 6 * * 4"
-    - cron: "0 7 * * 4"
   workflow_dispatch: {}  # allows manual run
 
 jobs:
@@ -14,7 +13,7 @@ jobs:
     timeout-minutes: 120
     concurrency:
       group: golf-booking-thursday
-      cancel-in-progress: false
+      cancel-in-progress: true
     env:
       TZ: Australia/Sydney
       HEADLESS: "true"

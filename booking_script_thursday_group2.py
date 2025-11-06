@@ -208,7 +208,7 @@ def hold_until_queue_poll_window(driver: webdriver.Chrome) -> None:
             )
             return
         seconds_left = (target - local_now).total_seconds()
-        if seconds_left > 180:
+        if seconds_left > 300:
             sleep_for = 60
         elif seconds_left > 60:
             sleep_for = 30
