@@ -39,6 +39,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 from selenium.webdriver.remote.webelement import WebElement
 
+import re
 
 # ------------------------------------------------------------------------------------
 # CONFIG
@@ -357,11 +358,100 @@ def _wait_ready_state_complete(driver: webdriver.Chrome, timeout: int = 30) -> b
     return False
 
 
+# ------------------------------------------------------------------------------------
+# DRAW / QUEUE DETECTION (MiClub waiting room)
+# ------------------------------------------------------------------------------------
+def _detect_draw_state(driver: webdriver.Chrome) -> tuple[bool, int | None]:
+    """Detect the MiClub draw/waiting room with countdown timer.
+
+    Returns:
+        (is_in_draw, seconds_remaining)
+        - is_in_draw: True if "You are in the draw" banner is detected
+        - seconds_remaining: Parsed countdown in seconds, or None if not parseable
+    """
+    try:
+        # Look for the draw banner text
+        body_text = driver.find_element(By.TAG_NAME, "body").text
+        if "You are in the draw" not in body_text and "in the draw to access" not in body_text:
+            return False, None
+
+        # Try to parse the countdown "Opens in HH:MM:SS" or "Opens in MM:SS"
+        match = re.search(r"Opens\s+in\s+(\d{1,2}):(\d{2}):(\d{2})", body_text)
+        if match:
+            hours, mins, secs = int(match.group(1)), int(match.group(2)), int(match.group(3))
+            total_seconds = hours * 3600 + mins * 60 + secs
+            return True, total_seconds
+
+        # Try MM:SS format
+        match = re.search(r"Opens\s+in\s+(\d{1,2}):(\d{2})", body_text)
+        if match:
+            mins, secs = int(match.group(1)), int(match.group(2))
+            total_seconds = mins * 60 + secs
+            return True, total_seconds
+
+        # Draw detected but couldn't parse countdown
+        return True, None
+    except Exception:
+        return False, None
+
+
+def _detect_queue_position(driver: webdriver.Chrome) -> tuple[bool, int | None, int | None]:
+    """Detect the MiClub queue state with position number.
+
+    Returns:
+        (is_in_queue, position, approx_bookings_available)
+        - is_in_queue: True if queue banner detected
+        - position: Current queue position, or None if not parseable
+        - approx_bookings_available: Approximate bookings still available, or None
+    """
+    try:
+        body_text = driver.find_element(By.TAG_NAME, "body").text
+
+        # Check for queue indicators
+        if "Current Position" not in body_text and "placed in a queue" not in body_text:
+            return False, None, None
+
+        position = None
+        approx_available = None
+
+        # Parse "Current Position : X" (note spaces around colon)
+        match = re.search(r"Current\s+Position\s*:\s*(\d+)", body_text)
+        if match:
+            position = int(match.group(1))
+
+        # Parse "Approximate Bookings Available : ~X"
+        match = re.search(r"Approximate\s+Bookings\s+Available\s*:\s*~?(\d+)", body_text)
+        if match:
+            approx_available = int(match.group(1))
+
+        return True, position, approx_available
+    except Exception:
+        return False, None, None
+
+
+def _has_tee_sheet(driver: webdriver.Chrome) -> bool:
+    """Return True if the tee-sheet table (with rows) is present."""
+    try:
+        table = driver.find_element(By.CLASS_NAME, "teetime-day-table")
+        rows = table.find_elements(By.XPATH, ".//div[contains(@class, 'row-time')]")
+        return bool(rows)
+    except Exception:
+        return False
+
+
 def _wait_teetime_table(driver: webdriver.Chrome, timeout: int) -> bool:
+    """Wait for tee sheet to appear, handling draw and queue states.
+
+    IMPORTANT: This function does NOT refresh when in draw or queue state
+    to avoid losing queue position. It waits for automatic redirect.
+    """
     _wait_ready_state_complete(driver, timeout=min(10, timeout))
-    end = time.time() + timeout
+    deadline = time.time() + timeout
     last_err: Exception | None = None
-    while time.time() < end:
+    last_status_log = 0.0
+
+    while time.time() < deadline:
+        # Check if tee sheet is available
         try:
             table = driver.find_element(By.CLASS_NAME, "teetime-day-table")
             rows = table.find_elements(By.XPATH, ".//div[contains(@class, 'row-time')]")
@@ -369,7 +459,42 @@ def _wait_teetime_table(driver: webdriver.Chrome, timeout: int) -> bool:
                 return True
         except Exception as exc:  # noqa: BLE001 - we retry until timeout
             last_err = exc
+
+        now = time.time()
+
+        # Check for draw state (countdown before 7pm)
+        in_draw, countdown_secs = _detect_draw_state(driver)
+        if in_draw:
+            if now - last_status_log > 10:
+                if countdown_secs is not None:
+                    log(f" -> In draw, countdown: {countdown_secs}s remaining. NOT refreshing.")
+                else:
+                    log(" -> In draw (countdown not parsed). NOT refreshing.")
+                last_status_log = now
+            # Extend deadline - we must wait for draw to complete
+            if countdown_secs is not None:
+                deadline = max(deadline, time.time() + countdown_secs + 60)
+            else:
+                deadline = max(deadline, time.time() + 120)
+            time.sleep(1)  # Poll frequently during draw
+            continue
+
+        # Check for queue state (after 7pm, waiting for turn)
+        in_queue, position, approx_available = _detect_queue_position(driver)
+        if in_queue:
+            if now - last_status_log > 5:
+                pos_str = str(position) if position is not None else "unknown"
+                avail_str = f"~{approx_available}" if approx_available is not None else "unknown"
+                log(f" -> In queue, position: {pos_str}, available: {avail_str}. NOT refreshing.")
+                last_status_log = now
+            # Extend deadline significantly - queue can take time
+            deadline = max(deadline, time.time() + 300)
+            time.sleep(0.5)  # Poll frequently, waiting for auto-redirect
+            continue
+
+        # Not in draw or queue - small sleep before retry
         time.sleep(0.25)
+
     log(f" -> TIMEOUT waiting for tee sheet (no rows). Last error: {last_err}")
     return False
 
@@ -477,16 +602,61 @@ def logout(driver: webdriver.Chrome) -> None:
 
 
 def navigate_and_wait_for_unlock(driver: webdriver.Chrome) -> bool:
-    log("Navigating to event list and waiting for bookings to open...")
+    """Navigate to event list and enter draw/queue as early as possible.
+
+    Strategy:
+    1. At 6:30pm (QUEUE_JOIN_TIME), click on the event to enter the draw
+    2. Once in draw, DO NOT REFRESH - wait for countdown and auto-redirect
+    3. Once in queue, DO NOT REFRESH - wait for position to reach zero
+    4. Detect when tee sheet becomes available
+    """
+    log("Navigating to event list and attempting to enter draw/queue...")
     driver.get(EVENT_LIST_URL)
-    queue_deadline = now_in_sydney().replace(
-        hour=QUEUE_JOIN_TIME[0],
-        minute=QUEUE_JOIN_TIME[1],
-        second=0,
-        microsecond=0,
-    )
-    deadline_notified = False
-    while True:
+
+    draw_entry_attempted = False
+    in_waiting_room = False  # True once we've entered draw or queue
+    max_wait_seconds = 1800  # 30 minutes max wait
+    deadline = time.time() + max_wait_seconds
+    last_status_log = 0.0
+
+    while time.time() < deadline:
+        now = time.time()
+
+        # If we're in the waiting room (draw or queue), check for tee sheet or keep waiting
+        if in_waiting_room:
+            # Check if tee sheet is now available (we've been redirected)
+            if _has_tee_sheet(driver):
+                log("SUCCESS! Tee sheet is now available after draw/queue.")
+                return True
+
+            # Check draw state
+            in_draw, countdown_secs = _detect_draw_state(driver)
+            if in_draw:
+                if now - last_status_log > 10:
+                    if countdown_secs is not None:
+                        log(f"In draw, countdown: {countdown_secs}s. Waiting (NO refresh)...")
+                    else:
+                        log("In draw (waiting for countdown). Waiting (NO refresh)...")
+                    last_status_log = now
+                time.sleep(1)
+                continue
+
+            # Check queue state
+            in_queue, position, approx_available = _detect_queue_position(driver)
+            if in_queue:
+                if now - last_status_log > 5:
+                    pos_str = str(position) if position is not None else "unknown"
+                    avail_str = f"~{approx_available}" if approx_available is not None else "unknown"
+                    log(f"In queue, position: {pos_str}, available: {avail_str}. Waiting (NO refresh)...")
+                    last_status_log = now
+                time.sleep(0.5)
+                continue
+
+            # Not in draw/queue anymore but tee sheet not found - might be transitioning
+            time.sleep(0.5)
+            continue
+
+        # Not yet in waiting room - try to enter
         try:
             event_div_xpath = (
                 f"//div[contains(@class, 'full') and "
@@ -497,33 +667,109 @@ def navigate_and_wait_for_unlock(driver: webdriver.Chrome) -> bool:
                 EC.presence_of_element_located((By.XPATH, event_div_xpath))
             )
             link = target_event_div.find_element(By.TAG_NAME, "a")
+            event_url = link.get_attribute("href") or ""
             classes = link.get_attribute("class") or ""
+
+            # If event is open, click it
             if "eventStatusOpen" in classes:
-                log(f"SUCCESS! {target_date_combo} is now OPEN. Clicking it!")
+                log(f"Event {target_date_combo} is OPEN. Clicking to enter...")
                 driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", link)
                 try:
                     link.click()
                 except ElementClickInterceptedException:
                     driver.execute_script("arguments[0].click();", link)
-                return True
-            log(
-                f"Status check: {target_date_combo} is still LOCKED. "
-                f"Refreshing in {OPEN_POLL_INTERVAL_SEC} seconds..."
+
+                time.sleep(1)
+
+                # Check if we landed on tee sheet directly
+                if _has_tee_sheet(driver):
+                    log("SUCCESS! Tee sheet loaded directly (no queue).")
+                    return True
+
+                # Check if we entered draw or queue
+                in_draw, _ = _detect_draw_state(driver)
+                in_queue, position, _ = _detect_queue_position(driver)
+                if in_draw or in_queue:
+                    in_waiting_room = True
+                    state = "draw" if in_draw else f"queue (position {position})"
+                    log(f"Entered {state}. Will wait without refreshing.")
+                    continue
+
+                # Might still be loading
+                log("Clicked event, waiting for page to settle...")
+                time.sleep(2)
+                continue
+
+            # Event not yet open - check if we're past the draw entry time
+            local_now = now_in_sydney()
+            draw_open_time = local_now.replace(
+                hour=QUEUE_JOIN_TIME[0],
+                minute=QUEUE_JOIN_TIME[1],
+                second=0,
+                microsecond=0,
             )
-            if not deadline_notified:
-                local_now = now_in_sydney()
-                if local_now >= queue_deadline:
-                    log(
-                        "[INFO] Queue unlock target time reached, continuing rapid polling "
-                        "until access opens."
-                    )
-                    deadline_notified = True
+
+            if local_now >= draw_open_time and not draw_entry_attempted:
+                # Try to click the event even if it shows as locked - draw might be open
+                log(f"Draw time reached ({QUEUE_JOIN_TIME[0]:02d}:{QUEUE_JOIN_TIME[1]:02d}). "
+                    "Attempting to click event...")
+                draw_entry_attempted = True
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", link)
+                try:
+                    link.click()
+                except ElementClickInterceptedException:
+                    driver.execute_script("arguments[0].click();", link)
+                except Exception as click_err:
+                    log(f"Click failed: {click_err}. Will retry via URL if available.")
+
+                time.sleep(1)
+
+                # Check if we entered draw/queue
+                in_draw, _ = _detect_draw_state(driver)
+                in_queue, position, _ = _detect_queue_position(driver)
+                if in_draw or in_queue:
+                    in_waiting_room = True
+                    state = "draw" if in_draw else f"queue (position {position})"
+                    log(f"Successfully entered {state}!")
+                    continue
+
+                # Try direct URL navigation if click didn't work
+                if event_url and not event_url.lower().startswith("javascript"):
+                    log(f"Trying direct navigation to: {event_url}")
+                    driver.get(event_url)
+                    time.sleep(1)
+                    in_draw, _ = _detect_draw_state(driver)
+                    in_queue, position, _ = _detect_queue_position(driver)
+                    if in_draw or in_queue:
+                        in_waiting_room = True
+                        state = "draw" if in_draw else f"queue (position {position})"
+                        log(f"Successfully entered {state} via direct URL!")
+                        continue
+
+                # Didn't enter draw - go back to event list and retry
+                log("Did not enter draw yet. Returning to event list...")
+                driver.get(EVENT_LIST_URL)
+                draw_entry_attempted = False  # Allow retry
+                time.sleep(2)
+                continue
+
+            # Before draw time - poll and wait
+            if now - last_status_log > 30:
+                log(f"Status: {target_date_combo} not yet open. Waiting for draw time...")
+                last_status_log = now
             time.sleep(OPEN_POLL_INTERVAL_SEC)
             driver.refresh()
+
         except Exception as exc:  # noqa: BLE001 - wait/retry
-            log(f"Page not ready, refreshing... REASON: {exc}")
+            log(f"Page not ready: {exc}. Refreshing...")
             time.sleep(3)
-            driver.refresh()
+            try:
+                driver.refresh()
+            except Exception:
+                driver.get(EVENT_LIST_URL)
+
+    log(f"TIMEOUT: Could not access tee sheet within {max_wait_seconds}s.")
+    return False
 
 
 def execute_group_booking(
@@ -639,11 +885,65 @@ def execute_group_booking(
 
                 log("Confirmation modal appeared and names validated. Clicking to finalise booking.")
                 try:
-                    yes_button.click()
-                except ElementClickInterceptedException:
-                    driver.execute_script("arguments[0].click();", yes_button)
-                log(f"SUCCESS: Booking command sent for {booker_username}'s group.")
+                    try:
+                        yes_button.click()
+                    except ElementClickInterceptedException:
+                        driver.execute_script("arguments[0].click();", yes_button)
+                except Exception as exc:
+                    log(f"    -> Failed to click Yes/Confirm: {exc}")
+                    snap_png(driver, f"attempt{attempt}_yes_click_failed")
+                    driver.refresh()
+                    time.sleep(2)
+                    continue
+
+                log(f"Booking command sent for {booker_username}'s group. Verifying...")
                 snap_png(driver, f"attempt{attempt}_after_confirm_click")
+
+                # Wait briefly then check for confirmation alert or page text
+                time.sleep(0.5)
+                booked_ok, alert_text = _safe_accept_alert(driver)
+                if booked_ok:
+                    log(f"SUCCESS: Booking finalised (alert said): {alert_text}")
+                    snap_png(driver, f"attempt{attempt}_booked_alert")
+                    return True
+
+                # Check page text for success indicators
+                try:
+                    body_text = driver.find_element(By.TAG_NAME, "body").text
+                except Exception:
+                    body_text = ""
+
+                success_indicators = [
+                    "Your booking has been made",
+                    "Booking successful",
+                    "successfully booked",
+                    "Booking confirmed",
+                ]
+                if any(indicator.lower() in body_text.lower() for indicator in success_indicators):
+                    log("SUCCESS: Booking finalised (page text indicates success).")
+                    snap_png(driver, f"attempt{attempt}_booked_page")
+                    return True
+
+                # Check if tee sheet shows our expected players (names in the modal)
+                if expected and _has_tee_sheet(driver):
+                    try:
+                        table = driver.find_element(By.CLASS_NAME, "teetime-day-table")
+                        sheet_text = table.text
+                        # Check if at least some expected names appear on the sheet
+                        names_found = sum(1 for name in expected if name in sheet_text)
+                        if names_found >= len(expected) // 2:  # At least half the names found
+                            log(f"SUCCESS: Found {names_found}/{len(expected)} expected names on tee sheet.")
+                            snap_png(driver, f"attempt{attempt}_names_on_sheet")
+                            return True
+                    except Exception:
+                        pass
+
+                # Booking may have gone through but unclear - log warning and return success
+                # (better to assume success and verify later than retry and double-book)
+                log("WARNING: Booking status unclear after clicking confirm. "
+                    "Assuming success - will verify in final check.")
+                snap_png(driver, f"attempt{attempt}_status_unclear")
+                snap_html(driver, f"attempt{attempt}_status_unclear")
                 return True
 
             log("    -> TIMEOUT waiting for confirm modal/alert. Refresh + retry...")
@@ -735,7 +1035,7 @@ def verify_all_bookings(driver: webdriver.Chrome, all_players: List[str]) -> Non
 
 
 def main() -> None:
-    log("--- Golf Booking Bot Initialized [v53 5pm login + staged queue] ---")
+    log("--- Golf Booking Bot Initialized [v54 draw/queue detection + no-refresh wait] ---")
     driver = make_driver()
 
     try:
