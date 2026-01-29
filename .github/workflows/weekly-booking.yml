@@ -1,18 +1,18 @@
-name: Thursday golf booking (Sydney 6 pm queue)
+name: Thursday golf booking - Group 2 (Sydney 6:30pm draw)
 
 on:
   schedule:
     # Start at 05:00 Sydney time every Thursday (06:00 UTC in AEDT, 07:00 UTC in AEST)
-    # so the runner is live an hour before queue polling begins.
+    # so the runner is live before the 6:30pm draw opens.
     - cron: "0 6 * * 4"
   workflow_dispatch: {}  # allows manual run
 
 jobs:
-  book:
+  book-group2:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 150  # 2.5 hours - allows for draw wait + queue + booking
     concurrency:
-      group: golf-booking-thursday
+      group: golf-booking-thursday-g2
       cancel-in-progress: true
     env:
       TZ: Australia/Sydney
@@ -48,17 +48,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run booking script
+      - name: Run Group 2 booking script
         env:
-          MIGOLF_USER_1: ${{ secrets.MIGOLF_USER_1 }}
-          MIGOLF_PASS_1: ${{ secrets.MIGOLF_PASS_1 }}
           MIGOLF_USER_2: ${{ secrets.MIGOLF_USER_2 }}
           MIGOLF_PASS_2: ${{ secrets.MIGOLF_PASS_2 }}
-          MIGOLF_USER_3: ${{ secrets.MIGOLF_USER_3 }}
-          MIGOLF_PASS_3: ${{ secrets.MIGOLF_PASS_3 }}
-          PREFERRED_DAY:  ${{ secrets.PREFERRED_DAY }}
-          PREFERRED_TIME: ${{ secrets.PREFERRED_TIME }}
-          PYTHONUNBUFFERED: "1"       # <-- live logs
+          PYTHONUNBUFFERED: "1"
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "schedule" ]; then
@@ -101,34 +95,14 @@ jobs:
           google-chrome --version || true
           chromedriver --version || true
 
-          echo "=== Launching Thursday scripts in parallel ==="
-          python -u booking_script_thursday.py &
-          PID_G1=$!
-          python -u booking_script_thursday_group2.py &
-          PID_G2=$!
+          echo "=== Running Group 2 booking script ==="
+          python -u booking_script_thursday_group2.py
 
-          set +e
-          wait "$PID_G1"
-          STATUS_G1=$?
-          wait "$PID_G2"
-          STATUS_G2=$?
-          set -e
-
-          echo "Group 1 script exit code: $STATUS_G1"
-          echo "Group 2 script exit code: $STATUS_G2"
-
-          if [ "$STATUS_G1" -ne 0 ] || [ "$STATUS_G2" -ne 0 ]; then
-            echo "At least one Thursday booking script failed."
-            exit 1
-          fi
-
-          echo "=== Both Thursday scripts finished successfully ==="
-
-      - name: Upload run logs (optional)
+      - name: Upload run logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: run-artifacts
+          name: run-artifacts-g2
           path: |
             golfbot_logs/**
           if-no-files-found: ignore

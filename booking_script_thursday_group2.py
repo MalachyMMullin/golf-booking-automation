@@ -601,7 +601,7 @@ def navigate_and_wait_for_unlock(driver: webdriver.Chrome) -> bool:
 
     draw_entry_attempted = False
     in_waiting_room = False  # True once we've entered draw or queue
-    max_wait_seconds = 1800  # 30 minutes max wait
+    max_wait_seconds = 3600  # 60 minutes - must wait for 30min draw countdown + queue + booking
     deadline = time.time() + max_wait_seconds
     last_status_log = 0.0
 
@@ -1021,7 +1021,7 @@ def verify_all_bookings(driver: webdriver.Chrome, all_players: List[str]) -> Non
 
 
 def main() -> None:
-    log("--- Golf Booking Bot Initialized [Thursday G2, v54 draw/queue detection + no-refresh wait] ---")
+    log("--- Golf Booking Bot Initialized [Thursday G2, v55 extended timeout for draw+queue] ---")
     driver = make_driver()
 
     try:
