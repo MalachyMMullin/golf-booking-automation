@@ -1,4 +1,4 @@
-name: Thursday golf booking - Group 1 (Sydney 6:30pm draw)
+name: Thursday golf booking - Group 2 (Sydney 6:30pm draw)
 
 on:
   schedule:
@@ -8,11 +8,11 @@ on:
   workflow_dispatch: {}  # allows manual run
 
 jobs:
-  book-group1:
+  book-group2:
     runs-on: ubuntu-latest
     timeout-minutes: 150  # 2.5 hours - allows for draw wait + queue + booking
     concurrency:
-      group: golf-booking-thursday-g1
+      group: golf-booking-thursday-g2
       cancel-in-progress: true
     env:
       TZ: Australia/Sydney
@@ -48,10 +48,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Group 1 booking script
+      - name: Run Group 2 booking script
         env:
-          MIGOLF_USER_1: ${{ secrets.MIGOLF_USER_1 }}
-          MIGOLF_PASS_1: ${{ secrets.MIGOLF_PASS_1 }}
+          MIGOLF_USER_2: ${{ secrets.MIGOLF_USER_2 }}
+          MIGOLF_PASS_2: ${{ secrets.MIGOLF_PASS_2 }}
           PYTHONUNBUFFERED: "1"
         run: |
           set -euo pipefail
@@ -95,14 +95,14 @@ jobs:
           google-chrome --version || true
           chromedriver --version || true
 
-          echo "=== Running Group 1 booking script ==="
-          python -u booking_script_thursday.py
+          echo "=== Running Group 2 booking script ==="
+          python -u booking_script_thursday_group2.py
 
       - name: Upload run logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: run-artifacts-g1
+          name: run-artifacts-g2
           path: |
             golfbot_logs/**
           if-no-files-found: ignore
