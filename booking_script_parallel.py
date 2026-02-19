@@ -1373,15 +1373,16 @@ def main() -> None:
                 break
             time.sleep(5)
 
+        # Capture states BEFORE manager shuts down
+        fourball_ok = fourball_booked.is_set()
+        twoball_ok  = twoball_booked.is_set()
+
         # Clean shutdown
         for p in processes:
             if p.is_alive():
                 log.info(f"Terminating {p.name}")
                 p.terminate()
                 p.join(timeout=10)
-
-    fourball_ok = fourball_booked.is_set()
-    twoball_ok  = twoball_booked.is_set()
 
     # Summary
     log.info("=== SUMMARY ===")
