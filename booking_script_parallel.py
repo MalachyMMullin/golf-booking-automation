@@ -456,15 +456,15 @@ def navigate_and_wait_for_tee_sheet(
 def _find_empty_player_inputs(driver: webdriver.Chrome) -> list:
     """
     Return empty player search input fields on the makeBooking page.
-    MiClub uses PrimeFaces AutoComplete — the visible input has class 'ui-autocomplete-input'.
+    MiClub (PrimeFaces) uses class 'ui-autocomplete-input' with placeholder 'Type Name'.
     Player 1 is always pre-filled (logged-in user), so we skip inputs with existing values.
     """
     try:
-        # Primary: PrimeFaces AutoComplete visible input
+        # Primary: PrimeFaces AutoComplete visible input (class-based — most reliable)
         selectors = [
             "//input[contains(@class,'ui-autocomplete-input') and not(@type='hidden')]",
-            "//input[contains(@placeholder,'Find Player') or contains(@placeholder,'find player') "
-            "or contains(@placeholder,'Search') or contains(@placeholder,'Player')]",
+            # Fallback: placeholder-based (MiClub uses 'Type Name', not 'Find Player')
+            "//input[contains(@placeholder,'Type Name') or contains(@placeholder,'type name')]",
             "//input[@type='text' and (contains(@class,'inputfield') or contains(@class,'autocomplete'))]",
         ]
         for sel in selectors:
@@ -547,7 +547,80 @@ def _try_select_partners_checkboxes(
                 log.debug(f"Checkbox check error: {e}")
     except Exception as exc:
         log.warning(f"Checkbox selection error: {exc}")
+
+    # If we ticked any checkboxes, click the "Select Partners" button to confirm them
+    if added > 0:
+        try:
+            select_btn = driver.find_element(
+                By.XPATH,
+                "//button[normalize-space()='Select Partners'] | "
+                "//a[normalize-space()='Select Partners'] | "
+                "//input[@value='Select Partners']"
+            )
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", select_btn)
+            try:
+                select_btn.click()
+            except ElementClickInterceptedException:
+                driver.execute_script("arguments[0].click();", select_btn)
+            log.info(f"Clicked 'Select Partners' button ({added} partners ticked)")
+            time.sleep(1.0)
+        except Exception as e:
+            log.debug(f"'Select Partners' button not found or click failed: {e}")
+
     return added
+
+
+def _clear_already_booked_slots(driver: webdriver.Chrome, log: logging.Logger) -> int:
+    """
+    On makeBooking.xhtml, detect player slots showing 'Member is already booked'
+    (inline error after Book Group → Yes pre-fills group) and remove them.
+    Returns number of slots cleared.
+    """
+    cleared = 0
+    try:
+        # Look for the warning/error text pattern "Member is already booked"
+        # These appear as text nodes or spans near the player input rows
+        error_rows = driver.find_elements(
+            By.XPATH,
+            "//*[contains(text(),'already booked') or contains(text(),'Member is already')]"
+        )
+        for err in error_rows:
+            if not err.is_displayed():
+                continue
+            log.info(f"Found already-booked error: '{err.text.strip()}'")
+            # Try to find and click the remove/X button in the same row
+            try:
+                # Walk up to the row container and find a remove button
+                for ancestor_xpath in ["./ancestor::tr[1]", "./ancestor::td[1]", "./ancestor::div[1]"]:
+                    try:
+                        container = err.find_element(By.XPATH, ancestor_xpath)
+                        # Look for remove buttons: span with X, link with 'remove', button with X icon
+                        remove_btns = container.find_elements(
+                            By.XPATH,
+                            ".//a[contains(@class,'remove') or contains(@onclick,'remove') or "
+                            "contains(@class,'delete') or @title='Remove'] | "
+                            ".//button[contains(@class,'remove') or contains(@class,'delete')] | "
+                            ".//span[contains(@class,'ui-icon-close') or contains(@class,'remove-player')]/.."
+                        )
+                        if remove_btns:
+                            driver.execute_script(
+                                "arguments[0].scrollIntoView({block:'center'});", remove_btns[0]
+                            )
+                            try:
+                                remove_btns[0].click()
+                            except ElementClickInterceptedException:
+                                driver.execute_script("arguments[0].click();", remove_btns[0])
+                            log.info("Cleared already-booked slot via remove button")
+                            cleared += 1
+                            time.sleep(0.5)
+                            break
+                    except Exception:
+                        continue
+            except Exception as e:
+                log.debug(f"Could not remove already-booked slot: {e}")
+    except Exception as exc:
+        log.debug(f"_clear_already_booked_slots error: {exc}")
+    return cleared
 
 
 def _search_and_select_player(
@@ -723,6 +796,12 @@ def execute_search_booking(
             except Exception:
                 pass
 
+            # Clear any pre-filled slots with "already booked" errors
+            cleared = _clear_already_booked_slots(driver, log)
+            if cleared:
+                log.info(f"Cleared {cleared} already-booked slot(s) — page reset")
+                time.sleep(0.5)
+
             # ── 5. Add partners ────────────────────────────────────────────
             # Strategy A: click the pre-configured "Select Partners" checkboxes
             # Strategy B: type member number into PrimeFaces autocomplete fields
@@ -817,7 +896,8 @@ def execute_search_booking(
                 confirm_btn = WebDriverWait(driver, 8).until(
                     EC.element_to_be_clickable(
                         (By.XPATH,
-                         "//a[normalize-space()='Confirm Booking'] | "
+                         "//button[.//span[contains(normalize-space(.),'Confirm Booking')]] | "
+                         "//a[contains(normalize-space(.),'Confirm Booking')] | "
                          "//button[normalize-space()='Confirm Booking']")
                     )
                 )
@@ -1080,7 +1160,8 @@ def execute_bookgroup_yes_fallback(
                         confirm = WebDriverWait(driver, 8).until(
                             EC.element_to_be_clickable(
                                 (By.XPATH,
-                                 "//a[normalize-space()='Confirm Booking'] | "
+                                 "//button[.//span[contains(normalize-space(.),'Confirm Booking')]] | "
+                                 "//a[contains(normalize-space(.),'Confirm Booking')] | "
                                  "//button[normalize-space()='Confirm Booking']")
                             )
                         )
@@ -1124,7 +1205,8 @@ def execute_bookgroup_yes_fallback(
                     confirm = WebDriverWait(driver, 8).until(
                         EC.element_to_be_clickable(
                             (By.XPATH,
-                             "//a[normalize-space()='Confirm Booking'] | "
+                             "//button[.//span[contains(normalize-space(.),'Confirm Booking')]] | "
+                             "//a[contains(normalize-space(.),'Confirm Booking')] | "
                              "//button[normalize-space()='Confirm Booking']")
                         )
                     )
