@@ -447,15 +447,100 @@ def navigate_and_wait_for_tee_sheet(
 # NEW: SEARCH-BASED BOOKING  (makeBooking.xhtml flow)
 # ─────────────────────────────────────────────────────────────────────────────
 def _find_empty_player_inputs(driver: webdriver.Chrome) -> list:
-    """Return all empty 'Find Player' input fields on the makeBooking page."""
+    """
+    Return empty player search input fields on the makeBooking page.
+    MiClub uses PrimeFaces AutoComplete — the visible input has class 'ui-autocomplete-input'.
+    Player 1 is always pre-filled (logged-in user), so we skip inputs with existing values.
+    """
     try:
-        inputs = driver.find_elements(
-            By.XPATH,
-            "//input[contains(@placeholder,'Find Player') or contains(@placeholder,'find player')]"
-        )
-        return [i for i in inputs if i.is_displayed() and not i.get_attribute("value")]
+        # Primary: PrimeFaces AutoComplete visible input
+        selectors = [
+            "//input[contains(@class,'ui-autocomplete-input') and not(@type='hidden')]",
+            "//input[contains(@placeholder,'Find Player') or contains(@placeholder,'find player') "
+            "or contains(@placeholder,'Search') or contains(@placeholder,'Player')]",
+            "//input[@type='text' and (contains(@class,'inputfield') or contains(@class,'autocomplete'))]",
+        ]
+        for sel in selectors:
+            inputs = driver.find_elements(By.XPATH, sel)
+            empties = [i for i in inputs if i.is_displayed() and not (i.get_attribute("value") or "").strip()]
+            if empties:
+                return empties
+        return []
     except Exception:
         return []
+
+
+def _try_select_partners_checkboxes(
+    driver: webdriver.Chrome,
+    partners_to_add: List[str],
+    log: logging.Logger,
+) -> int:
+    """
+    Click the pre-configured 'Select Partners' checkboxes that match the
+    required partners by member number or surname.  Returns number of players
+    successfully ticked.
+    """
+    # Build a lookup: member_number → surname
+    member_to_surname = {
+        "2007": "Mullin",  "2008": "Hillard",
+        "2009": "Rutherford", "2010": "Rudge",
+        "1101": "Lalor",   "1107": "Cheney",
+    }
+    target_names = {member_to_surname.get(p, p).lower() for p in partners_to_add}
+    added = 0
+    try:
+        # Checkboxes are rendered as <input type='checkbox'> with adjacent <label> text,
+        # or wrapped in a <span>/<div> with the player name.
+        checkboxes = driver.find_elements(
+            By.XPATH,
+            "//input[@type='checkbox']"
+        )
+        for cb in checkboxes:
+            if not cb.is_displayed():
+                continue
+            try:
+                # Get label text — look at associated label, parent text, or sibling text
+                cb_id = cb.get_attribute("id") or ""
+                label_text = ""
+                if cb_id:
+                    try:
+                        label = driver.find_element(By.XPATH, f"//label[@for='{cb_id}']")
+                        label_text = label.text.strip().lower()
+                    except Exception:
+                        pass
+                if not label_text:
+                    try:
+                        label_text = cb.find_element(By.XPATH, "./parent::*/text()").get_attribute("textContent") or ""
+                        label_text = label_text.strip().lower()
+                    except Exception:
+                        pass
+                if not label_text:
+                    try:
+                        label_text = cb.find_element(By.XPATH, "./following-sibling::*[1]").text.strip().lower()
+                    except Exception:
+                        pass
+                if not label_text:
+                    try:
+                        parent = cb.find_element(By.XPATH, "./parent::*")
+                        label_text = parent.text.strip().lower()
+                    except Exception:
+                        pass
+
+                if any(name in label_text for name in target_names):
+                    if not cb.is_selected():
+                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", cb)
+                        try:
+                            cb.click()
+                        except ElementClickInterceptedException:
+                            driver.execute_script("arguments[0].click();", cb)
+                        log.info(f"Ticked checkbox: {label_text}")
+                        added += 1
+                        time.sleep(0.3)
+            except Exception as e:
+                log.debug(f"Checkbox check error: {e}")
+    except Exception as exc:
+        log.warning(f"Checkbox selection error: {exc}")
+    return added
 
 
 def _search_and_select_player(
@@ -631,11 +716,37 @@ def execute_search_booking(
             except Exception:
                 pass
 
-            # ── 5. Add partners by search ──────────────────────────────────
+            # ── 5. Add partners ────────────────────────────────────────────
+            # Strategy A: click the pre-configured "Select Partners" checkboxes
+            # Strategy B: type member number into PrimeFaces autocomplete fields
+            # Strategy A is faster and more reliable when pre-configured groups match.
+
+            ticked = _try_select_partners_checkboxes(driver, partners_to_add, log)
+            log.info(f"Checkbox strategy: ticked {ticked}/{len(partners_to_add)} partners")
+
+            # Check how many Find Player inputs are still empty after checkboxes
+            still_empty = _find_empty_player_inputs(driver)
+            log.info(f"Empty Find Player inputs remaining after checkboxes: {len(still_empty)} "
+                     f"(need {len(partners_to_add) - ticked} more via search)")
+
+            # Diagnostic: log what the current page inputs look like
+            try:
+                all_inputs = driver.find_elements(By.XPATH, "//input[@type='text' and not(@disabled)]")
+                log.info(f"DEBUG: Found {len(all_inputs)} visible text inputs on makeBooking page")
+                for inp in all_inputs[:8]:
+                    log.info(f"  input class='{inp.get_attribute('class')}' "
+                             f"placeholder='{inp.get_attribute('placeholder')}' "
+                             f"value='{inp.get_attribute('value')}'")
+            except Exception:
+                pass
+
+            # Strategy B: autocomplete search for any partners not yet added
+            remaining_partners = partners_to_add[ticked:] if ticked < len(partners_to_add) else []
+
             # If a member is already in the tee sheet / already booked,
             # skip them and fill the slot with the next available partner.
             skipped: List[str] = []
-            for member_num in partners_to_add:
+            for member_num in remaining_partners:
                 empty_inputs = _find_empty_player_inputs(driver)
                 if not empty_inputs:
                     log.info("No more empty Find Player slots — all filled.")
@@ -1102,16 +1213,24 @@ def worker(
 
             if success and not fourball_booked.is_set():
                 fourball_booked.set()
-                with fourball_winner_val.get_lock():
+                try:
                     fourball_winner_val.value = username.encode()[:64]
+                except Exception:
+                    pass
                 log.info(f"🏆 4-ball booked by {username}!")
                 logout(driver, log)
                 return
             log.info("4-ball attempt complete (may have been taken by another worker)")
         else:
-            log.info("4-ball already booked by another worker — going straight to 2-ball")
+            log.info("4-ball already booked by another worker.")
 
-        # ── Attempt 2-ball ────────────────────────────────────────────────
+        # 4-ball members have no role in the 2-ball — exit cleanly
+        if username in FOUR_BALL_MEMBERS:
+            log.info(f"{username} is a 4-ball member — nothing more to do.")
+            logout(driver, log)
+            return
+
+        # ── Attempt 2-ball (only 2-ball group members reach here) ─────────
         if not twoball_booked.is_set():
             try:
                 winner = fourball_winner_val.value.decode().rstrip('\x00')
