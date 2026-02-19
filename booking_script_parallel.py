@@ -83,7 +83,7 @@ QUEUE_JOIN_TIME   = (18, 30)  # ballot opens at 6:30pm — click event link here
 BOOKING_OPEN_TIME = (19,  0)  # tee sheet releases at 7:00pm
 HARD_TIMEOUT_TIME = (20,  0)  # give up at 8:00pm — no earlier
 
-OPEN_POLL_INTERVAL = 2   # seconds between event-list refreshes before draw
+OPEN_POLL_INTERVAL = 15  # seconds between event-list refreshes before draw (6 workers × 15s = low load)
 BOOKING_MAX_ATTEMPTS = 999  # effectively unlimited — hard deadline is HARD_TIMEOUT_TIME
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -398,11 +398,19 @@ def navigate_and_wait_for_tee_sheet(
                 time.sleep(2)
                 continue
 
-            # Not yet draw time
+            # Not yet draw time — poll slowly when far away, tighten near 6:30
+            local_now  = now_sydney()
+            draw_open  = local_now.replace(hour=QUEUE_JOIN_TIME[0], minute=QUEUE_JOIN_TIME[1], second=0, microsecond=0)
+            secs_to_draw = (draw_open - local_now).total_seconds()
+            if secs_to_draw > 120:
+                poll_interval = OPEN_POLL_INTERVAL  # 15s when >2 min away
+            else:
+                poll_interval = 2  # tight polling in final 2 minutes
+
             if now - last_status_log > 30:
-                log.info(f"Waiting for draw time ({QUEUE_JOIN_TIME[0]:02d}:{QUEUE_JOIN_TIME[1]:02d})...")
+                log.info(f"Waiting for draw time ({QUEUE_JOIN_TIME[0]:02d}:{QUEUE_JOIN_TIME[1]:02d}) — {secs_to_draw:.0f}s away...")
                 last_status_log = now
-            time.sleep(OPEN_POLL_INTERVAL)
+            time.sleep(poll_interval)
             driver.refresh()
             safe_accept_alert(driver)
 
