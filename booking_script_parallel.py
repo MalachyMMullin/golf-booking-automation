@@ -237,6 +237,13 @@ def has_tee_sheet(driver: webdriver.Chrome) -> bool:
 # DATE TARGET  (next-next Saturday from Thursday)
 # ─────────────────────────────────────────────────────────────────────────────
 def compute_target() -> Tuple[str, str]:
+    # Allow env var override for manual/test runs (e.g. OVERRIDE_TARGET_DAY=Sun OVERRIDE_TARGET_DATE="1 Mar")
+    override_day  = os.getenv("OVERRIDE_TARGET_DAY", "").strip()
+    override_date = os.getenv("OVERRIDE_TARGET_DATE", "").strip()
+    if override_day and override_date:
+        return override_day, override_date
+
+    # Default: next-next Saturday from the current Thursday
     now = now_sydney()
     days_to_sat = (5 - now.weekday() + 7) % 7 or 7
     upcoming_sat = now + timedelta(days=days_to_sat)
