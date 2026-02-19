@@ -55,12 +55,11 @@ from selenium.webdriver.support.ui import WebDriverWait
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Member numbers for fixed groups.
-# UPDATE 2009/2010/1101/1107 once name mapping is confirmed.
 FOUR_BALL_MEMBERS: List[str] = ["2007", "2008", "2009", "2010"]
-# Names (for reference): Mullin=2007, Hillard=2008, Rutherford=?, Rudge=?
+# Mullin=2007, Hillard=2008, Rutherford=2009, Rudge=2010
 
 TWO_BALL_MEMBERS: List[str] = ["1101", "1107"]
-# Names (for reference): Lalor=?, Cheney=?
+# Lalor=1101, Cheney=1107
 
 # All accounts that will enter the draw (credentials from env vars or defaults)
 ALL_USERS = [
@@ -79,12 +78,13 @@ LOGIN_URL      = "https://macquarielinks.miclub.com.au/security/login.msp"
 EVENT_LIST_URL = "https://macquarielinks.miclub.com.au/views/members/booking/eventList.xhtml"
 LOGOUT_URL     = "https://macquarielinks.miclub.com.au/security/logout.msp"
 
-QUEUE_POLL_TIME   = (18, 0)   # start polling event list
-QUEUE_JOIN_TIME   = (18, 30)  # draw unlocks
-BOOKING_OPEN_TIME = (19, 0)   # tee sheet releases
+LOGIN_TIME        = (18,  0)  # login at 6:00pm Sydney
+QUEUE_JOIN_TIME   = (18, 30)  # ballot opens at 6:30pm — click event link here
+BOOKING_OPEN_TIME = (19,  0)  # tee sheet releases at 7:00pm
+HARD_TIMEOUT_TIME = (20,  0)  # give up at 8:00pm — no earlier
 
-OPEN_POLL_INTERVAL = 2   # seconds between event-list refresh before draw
-BOOKING_MAX_ATTEMPTS = 40
+OPEN_POLL_INTERVAL = 2   # seconds between event-list refreshes before draw
+BOOKING_MAX_ATTEMPTS = 999  # effectively unlimited — hard deadline is HARD_TIMEOUT_TIME
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING  (per-worker files)
@@ -119,6 +119,33 @@ def make_worker_logger(username: str) -> logging.Logger:
 # ─────────────────────────────────────────────────────────────────────────────
 def now_sydney() -> datetime:
     return datetime.now(timezone.utc).astimezone(SYDNEY_TZ)
+
+
+def hard_deadline_sydney() -> float:
+    """Unix timestamp for today's HARD_TIMEOUT_TIME in Sydney."""
+    now = now_sydney()
+    target = now.replace(
+        hour=HARD_TIMEOUT_TIME[0], minute=HARD_TIMEOUT_TIME[1], second=0, microsecond=0
+    )
+    return target.timestamp()
+
+
+def wait_until_sydney(hour: int, minute: int, label: str, log: logging.Logger) -> None:
+    """Sleep until the given Sydney wall-clock time (if not already past it)."""
+    now = now_sydney()
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if now >= target:
+        log.info(f"{label}: already past {hour:02d}:{minute:02d} Sydney — continuing immediately.")
+        return
+    log.info(f"{label}: waiting until {hour:02d}:{minute:02d} Sydney. Currently {now:%H:%M:%S}.")
+    while True:
+        now = now_sydney()
+        if now >= target:
+            log.info(f"{label}: reached {hour:02d}:{minute:02d}. Continuing.")
+            return
+        secs_left = (target - now).total_seconds()
+        sleep_for = min(max(1, secs_left - 2), 60 if secs_left > 120 else 10)
+        time.sleep(sleep_for)
 
 
 def snap(driver: webdriver.Chrome, name: str, log: logging.Logger) -> None:
@@ -281,7 +308,7 @@ def navigate_and_wait_for_tee_sheet(
 
     in_waiting_room  = False
     draw_attempted   = False
-    deadline         = time.time() + 3600
+    deadline         = hard_deadline_sydney()   # hard stop at 8pm Sydney
     last_status_log  = 0.0
 
     while time.time() < deadline:
@@ -487,9 +514,13 @@ def execute_search_booking(
     required_slots:  total players needed (4 for 4-ball, 2 for 2-ball)
     """
     log.info(f"Starting search-based booking for {required_slots}-ball. Partners: {partners_to_add}")
+    deadline = hard_deadline_sydney()
 
-    for attempt in range(1, max_attempts + 1):
-        log.info(f"Booking attempt {attempt}/{max_attempts}...")
+    attempt = 0
+    while attempt < max_attempts and time.time() < deadline:
+        attempt += 1
+        mins_remaining = max(0, (deadline - time.time()) / 60)
+        log.info(f"Booking attempt {attempt} ({mins_remaining:.0f} min until 8pm timeout)...")
 
         try:
             # ── 1. Find a suitable row ─────────────────────────────────────
@@ -582,24 +613,60 @@ def execute_search_booking(
                 pass
 
             # ── 5. Add partners by search ──────────────────────────────────
-            all_added = True
+            # If a member is already in the tee sheet / already booked,
+            # skip them and fill the slot with the next available partner.
+            skipped: List[str] = []
             for member_num in partners_to_add:
                 empty_inputs = _find_empty_player_inputs(driver)
                 if not empty_inputs:
-                    log.error("No empty Find Player inputs left!")
-                    all_added = False
+                    log.info("No more empty Find Player slots — all filled.")
                     break
                 ok = _search_and_select_player(driver, empty_inputs[0], member_num, log)
                 if not ok:
-                    log.error(f"Failed to add player {member_num}")
-                    all_added = False
-                    break
+                    log.warning(f"Could not add {member_num} (may already be booked) — skipping")
+                    skipped.append(member_num)
+                    continue
                 time.sleep(0.5)
 
-            if not all_added:
-                log.warning("Could not add all partners — cancelling and retrying")
+                # Check for "already booked" error message after adding
                 try:
-                    cancel = driver.find_element(By.XPATH, "//a[normalize-space()='CANCEL'] | //button[normalize-space()='Cancel']")
+                    body = driver.find_element(By.TAG_NAME, "body").text
+                    already_booked_phrases = [
+                        "already booked", "already has a booking",
+                        "existing booking", "already registered",
+                    ]
+                    if any(p in body.lower() for p in already_booked_phrases):
+                        log.warning(f"Player {member_num} already has a booking — removing and skipping")
+                        # Try to remove them (click the red X next to their name)
+                        try:
+                            remove_btns = driver.find_elements(
+                                By.XPATH,
+                                f"//input[contains(@value,'{member_num}') or "
+                                f"contains(following-sibling::*,'{member_num}')]"
+                                "/ancestor::*[1]//a[contains(@class,'remove') or contains(@class,'delete') or @title='Remove']"
+                            )
+                            if remove_btns:
+                                remove_btns[0].click()
+                                time.sleep(0.5)
+                        except Exception:
+                            pass
+                        skipped.append(member_num)
+                except Exception:
+                    pass
+
+            if skipped:
+                log.info(f"Skipped already-booked members: {skipped}. Proceeding with remaining players.")
+
+            # We need at least 1 partner added (plus self = 2 minimum)
+            empty_remaining = _find_empty_player_inputs(driver)
+            total_filled = (required_slots - 1) - len(empty_remaining)  # -1 because Player 1 is self
+            if total_filled < 1 and required_slots > 1:
+                log.warning("No partners could be added at all — cancelling and retrying slot")
+                try:
+                    cancel = driver.find_element(
+                        By.XPATH,
+                        "//a[normalize-space()='CANCEL'] | //button[normalize-space()='Cancel']"
+                    )
                     cancel.click()
                 except Exception:
                     driver.get(EVENT_LIST_URL)
@@ -750,6 +817,9 @@ def worker(
     try:
         driver = make_driver()
 
+        # Wait until 6:00pm Sydney before logging in
+        wait_until_sydney(LOGIN_TIME[0], LOGIN_TIME[1], "Login gate", log)
+
         if not login(driver, username, password, log):
             log.error("Login failed — exiting worker")
             return
@@ -847,8 +917,8 @@ def main() -> None:
             processes.append(p)
             time.sleep(0.5)  # stagger starts slightly
 
-        # Wait for both bookings to complete, or all workers to finish
-        deadline = time.time() + 7200  # 2hr hard limit
+        # Wait for both bookings to complete, or all workers to finish — hard stop at 8pm
+        deadline = hard_deadline_sydney()
         while time.time() < deadline:
             if fourball_booked.is_set() and twoball_booked.is_set():
                 log.info("✅ Both bookings complete!")

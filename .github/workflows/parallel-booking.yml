@@ -2,9 +2,10 @@ name: Thursday golf booking - Parallel (all 6 users)
 
 on:
   schedule:
-    # 06:00 UTC Thursday = 17:00 AEST (UTC+11) / 16:00 AEDT (UTC+10)
-    # Start early so all workers are logged in well before the 6:30pm draw.
-    - cron: "0 6 * * 4"
+    # 07:00 UTC Thursday = 18:00 AEDT (UTC+11, Oct–Apr) / 17:00 AEST (UTC+10, Apr–Oct)
+    # The script waits internally until 18:00 Sydney time before logging in,
+    # so this handles both AEDT and AEST automatically.
+    - cron: "0 7 * * 4"
   workflow_dispatch: {}
 
 jobs:
@@ -46,32 +47,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
-      - name: Wait for Sydney login window (scheduled runs only)
-        if: github.event_name == 'schedule'
-        run: |
-          # Wait until 18:00 Sydney time before starting login
-          WINDOW_START=$((18 * 60))
-          WINDOW_END=$((18 * 60 + 15))
-          while true; do
-            SYD_HOUR=$(TZ=Australia/Sydney date +%H)
-            SYD_MIN=$(TZ=Australia/Sydney date +%M)
-            SYD_TOTAL=$((10#$SYD_HOUR * 60 + 10#$SYD_MIN))
-            if [ "$SYD_TOTAL" -lt "$WINDOW_START" ]; then
-              REMAIN=$((WINDOW_START - SYD_TOTAL))
-              SLEEP=$((REMAIN > 5 ? 300 : REMAIN * 60))
-              [ "$SLEEP" -le 0 ] && SLEEP=30
-              echo "Waiting for 18:00 Sydney (${SYD_HOUR}:${SYD_MIN}). Sleeping ${SLEEP}s."
-              sleep "$SLEEP"
-            elif [ "$SYD_TOTAL" -gt "$WINDOW_END" ]; then
-              echo "Past 18:15 — proceeding immediately (${SYD_HOUR}:${SYD_MIN})."
-              break
-            else
-              echo "In login window (${SYD_HOUR}:${SYD_MIN}) — proceeding."
-              break
-            fi
-          done
-          echo "Starting at $(TZ=Australia/Sydney date '+%Y-%m-%d %H:%M:%S %Z')"
 
       - name: Print Chrome versions
         run: |
