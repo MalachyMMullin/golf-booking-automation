@@ -1,12 +1,16 @@
 name: Friday golf booking - Parallel (Sundays)
 
 on:
+  schedule:
+    # ONE-TIME: 07:00 UTC 20 Feb 2026 = 18:00 AEDT — Sunday 1 Mar booking
+    # Remove this schedule block after the run completes.
+    - cron: "0 7 20 2 *"
   workflow_dispatch:
     inputs:
       target_date:
         description: "Target Sunday date (e.g. 1 Mar)"
         required: true
-        default: ""
+        default: "1 Mar"
 
 jobs:
   parallel-book:
@@ -53,6 +57,15 @@ jobs:
           google-chrome --version || true
           chromedriver --version || true
 
+      - name: Resolve target date
+        run: |
+          INPUT="${{ github.event.inputs.target_date }}"
+          if [ -z "$INPUT" ]; then
+            echo "RESOLVED_TARGET_DATE=1 Mar" >> $GITHUB_ENV
+          else
+            echo "RESOLVED_TARGET_DATE=$INPUT" >> $GITHUB_ENV
+          fi
+
       - name: Run parallel booking script (Sunday target)
         env:
           MIGOLF_USER_1: ${{ secrets.MIGOLF_USER_1 }}
@@ -70,7 +83,7 @@ jobs:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           OVERRIDE_TARGET_DAY: "Sun"
-          OVERRIDE_TARGET_DATE: ${{ github.event.inputs.target_date }}
+          OVERRIDE_TARGET_DATE: ${{ env.RESOLVED_TARGET_DATE }}
           PYTHONUNBUFFERED: "1"
         run: python -u booking_script_parallel.py
 
