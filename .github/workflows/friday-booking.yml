@@ -1,12 +1,12 @@
-name: Thursday golf booking - Parallel (all 6 users)
+name: Friday golf booking - Parallel (Sundays)
 
 on:
-  schedule:
-    # 07:00 UTC Thursday = 18:00 AEDT (UTC+11, Oct–Apr) / 17:00 AEST (UTC+10, Apr–Oct)
-    # The script waits internally until 18:00 Sydney time before logging in,
-    # so this handles both AEDT and AEST automatically.
-    - cron: "0 7 * * 4"
-  workflow_dispatch: {}  # Manual trigger only — targets next-next Saturday automatically
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: "Target Sunday date (e.g. 1 Mar)"
+        required: true
+        default: ""
 
 jobs:
   parallel-book:
@@ -53,7 +53,7 @@ jobs:
           google-chrome --version || true
           chromedriver --version || true
 
-      - name: Run parallel booking script
+      - name: Run parallel booking script (Sunday target)
         env:
           MIGOLF_USER_1: ${{ secrets.MIGOLF_USER_1 }}
           MIGOLF_PASS_1: ${{ secrets.MIGOLF_PASS_1 }}
@@ -69,6 +69,8 @@ jobs:
           MIGOLF_PASS_6: ${{ secrets.MIGOLF_PASS_6 }}
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          OVERRIDE_TARGET_DAY: "Sun"
+          OVERRIDE_TARGET_DATE: ${{ github.event.inputs.target_date }}
           PYTHONUNBUFFERED: "1"
         run: python -u booking_script_parallel.py
 
@@ -76,6 +78,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: parallel-run-artifacts
+          name: friday-run-artifacts
           path: golfbot_logs/**
           if-no-files-found: ignore
