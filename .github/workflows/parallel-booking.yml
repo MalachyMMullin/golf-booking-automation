@@ -67,6 +67,8 @@ jobs:
           MIGOLF_PASS_5: ${{ secrets.MIGOLF_PASS_5 }}
           MIGOLF_USER_6: ${{ secrets.MIGOLF_USER_6 }}
           MIGOLF_PASS_6: ${{ secrets.MIGOLF_PASS_6 }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           PYTHONUNBUFFERED: "1"
         run: python -u booking_script_parallel.py
 

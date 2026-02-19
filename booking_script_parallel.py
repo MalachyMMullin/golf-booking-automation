@@ -21,9 +21,12 @@ import multiprocessing
 import os
 import re
 import shutil
+import smtplib
 import subprocess
 import time
 import zipfile
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from datetime import datetime, timedelta, timezone
 from multiprocessing.managers import SyncManager
 from pathlib import Path
@@ -60,6 +63,14 @@ FOUR_BALL_MEMBERS: List[str] = ["2007", "2008", "2009", "2010"]
 
 TWO_BALL_MEMBERS: List[str] = ["1101", "1107"]
 # Lalor=1101, Cheney=1107
+
+# Email notification (Gmail SMTP + App Password)
+NOTIFICATION_EMAIL = "malachy.m.mullin@gmail.com"
+GMAIL_USER         = os.getenv("GMAIL_USER", "")
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
+
+# Player surnames for tee-sheet verification (used after booking to confirm)
+ALL_PLAYER_SURNAMES = ["Mullin", "Hillard", "Rutherford", "Rudge", "Lalor", "Cheney"]
 
 # All accounts that will enter the draw (credentials from env vars or defaults)
 ALL_USERS = [
@@ -1137,6 +1148,179 @@ def worker(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# VERIFICATION  (checks tee sheet after booking, retries if missing players)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def verify_bookings(
+    target_day: str,
+    target_date: str,
+    log: logging.Logger,
+    retry_fourball: bool = True,
+    retry_twoball: bool = True,
+) -> dict:
+    """
+    Log in as the first user, navigate to the target tee sheet, and check
+    that all 6 players appear. Returns a dict with confirmed/missing lists.
+    If players are missing, attempts to rebook them.
+    """
+    log.info("=== VERIFICATION: Checking tee sheet for all 6 players ===")
+    result = {"confirmed": [], "missing": [], "tee_times": []}
+
+    verifier = ALL_USERS[0]  # Use first account to verify
+    driver = None
+    try:
+        driver = make_driver()
+        if not login(driver, verifier["username"], verifier["password"], log):
+            log.error("Verification: could not log in")
+            return result
+
+        if not navigate_and_wait_for_tee_sheet(driver, target_day, target_date, log):
+            log.error("Verification: tee sheet not reachable")
+            return result
+
+        # Read all rows and look for player names
+        try:
+            table = driver.find_element(By.CLASS_NAME, "teetime-day-table")
+            rows  = table.find_elements(By.XPATH, ".//div[contains(@class,'row-time')]")
+        except Exception as exc:
+            log.error(f"Verification: could not read tee sheet: {exc}")
+            return result
+
+        sheet_text = table.text
+        snap(driver, "verify_teesheet", log)
+
+        log.info("─── Tee sheet contents ───")
+        for row in rows:
+            try:
+                t = row.find_element(By.TAG_NAME, "h3").text
+                links = row.find_elements(By.XPATH, ".//a[contains(@href,'member')]")
+                names = [l.text.strip() for l in links if l.text.strip()]
+                if names:
+                    entry = f"{t}: {', '.join(names)}"
+                    result["tee_times"].append(entry)
+                    log.info(f"  {entry}")
+            except Exception:
+                continue
+
+        # Check each player surname
+        for surname in ALL_PLAYER_SURNAMES:
+            if surname.lower() in sheet_text.lower():
+                result["confirmed"].append(surname)
+                log.info(f"  ✅ {surname} — confirmed on tee sheet")
+            else:
+                result["missing"].append(surname)
+                log.warning(f"  ❌ {surname} — NOT found on tee sheet")
+
+        # Retry missing players if any
+        if result["missing"] and (retry_fourball or retry_twoball):
+            log.warning(f"Missing players: {result['missing']} — attempting to rebook")
+            # Determine which group they belong to and attempt re-booking
+            # Use current driver (already logged in as verifier)
+            missing_in_4ball = [m for m in result["missing"]
+                                if any(m.lower() in ["mullin","hillard","rutherford","rudge"])]
+            missing_in_2ball = [m for m in result["missing"]
+                                if any(m.lower() in ["lalor","cheney"])]
+
+            if missing_in_4ball and retry_fourball:
+                log.info(f"Re-attempting 4-ball for missing: {missing_in_4ball}")
+                # Map surnames back to member numbers for re-booking
+                name_to_member = {
+                    "mullin": "2007", "hillard": "2008",
+                    "rutherford": "2009", "rudge": "2010",
+                    "lalor": "1101", "cheney": "1107",
+                }
+                partners = [name_to_member[n.lower()] for n in missing_in_4ball
+                           if n.lower() in name_to_member and name_to_member[n.lower()] != verifier["username"]]
+                if partners:
+                    execute_search_booking(driver, verifier["username"], partners, len(partners) + 1, log)
+
+            if missing_in_2ball and retry_twoball:
+                log.info(f"Re-attempting 2-ball for missing: {missing_in_2ball}")
+                name_to_member = {
+                    "mullin": "2007", "hillard": "2008",
+                    "rutherford": "2009", "rudge": "2010",
+                    "lalor": "1101", "cheney": "1107",
+                }
+                partners = [name_to_member[n.lower()] for n in missing_in_2ball
+                           if n.lower() in name_to_member and name_to_member[n.lower()] != verifier["username"]]
+                if partners:
+                    execute_search_booking(driver, verifier["username"], partners, len(partners) + 1, log)
+
+        logout(driver, log)
+
+    except Exception as exc:
+        log.exception(f"Verification error: {exc}")
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EMAIL NOTIFICATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def send_confirmation_email(
+    target_date: str,
+    result: dict,
+    fourball_ok: bool,
+    twoball_ok: bool,
+    log: logging.Logger,
+) -> None:
+    """Send a booking confirmation (or failure alert) to NOTIFICATION_EMAIL via Gmail SMTP."""
+    if not GMAIL_USER or not GMAIL_APP_PASSWORD:
+        log.warning("Email: GMAIL_USER or GMAIL_APP_PASSWORD not set — skipping email")
+        return
+
+    all_confirmed = len(result.get("missing", [])) == 0
+    subject = (
+        f"⛳ Golf Booking {'Confirmed' if all_confirmed else 'PARTIAL/FAILED'} — {target_date}"
+    )
+
+    lines = [
+        f"Golf booking run complete for {target_date}.",
+        "",
+        f"4-ball booked: {'✅ Yes' if fourball_ok else '❌ No'}",
+        f"2-ball booked: {'✅ Yes' if twoball_ok else '❌ No'}",
+        "",
+        "── Tee Sheet Verification ──",
+    ]
+    if result.get("confirmed"):
+        lines.append(f"Confirmed on sheet: {', '.join(result['confirmed'])}")
+    if result.get("missing"):
+        lines.append(f"⚠️  NOT found on sheet: {', '.join(result['missing'])}")
+    else:
+        lines.append("All 6 players confirmed on the tee sheet ✅")
+
+    if result.get("tee_times"):
+        lines += ["", "── Your tee times ──"]
+        lines += [f"  {t}" for t in result["tee_times"]
+                  if any(s.lower() in t.lower() for s in ALL_PLAYER_SURNAMES)]
+
+    body = "\n".join(lines)
+    log.info(f"Email body:\n{body}")
+
+    try:
+        msg = MIMEMultipart()
+        msg["From"]    = GMAIL_USER
+        msg["To"]      = NOTIFICATION_EMAIL
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain"))
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+            server.sendmail(GMAIL_USER, NOTIFICATION_EMAIL, msg.as_string())
+
+        log.info(f"✉️  Confirmation email sent to {NOTIFICATION_EMAIL}")
+    except Exception as exc:
+        log.error(f"Email failed: {exc}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:
@@ -1196,11 +1380,26 @@ def main() -> None:
                 p.terminate()
                 p.join(timeout=10)
 
+    fourball_ok = fourball_booked.is_set()
+    twoball_ok  = twoball_booked.is_set()
+
     # Summary
     log.info("=== SUMMARY ===")
-    log.info(f"4-ball booked: {fourball_booked.is_set()}")
-    log.info(f"2-ball booked: {twoball_booked.is_set()}")
+    log.info(f"4-ball booked: {fourball_ok}")
+    log.info(f"2-ball booked: {twoball_ok}")
     log.info(f"Log directory: {RUN_DIR}")
+
+    # Verification — confirm all 6 players appear on the tee sheet
+    verify_result = {"confirmed": [], "missing": [], "tee_times": []}
+    if fourball_ok or twoball_ok:
+        log.info("Waiting 30s for bookings to propagate before verifying...")
+        time.sleep(30)
+        verify_result = verify_bookings(target_day, target_date, log)
+    else:
+        log.warning("No bookings confirmed — skipping verification")
+
+    # Email
+    send_confirmation_email(target_date, verify_result, fourball_ok, twoball_ok, log)
 
     # Zip logs
     zip_path = RUN_ROOT / f"{RUN_ID}.zip"
