@@ -774,6 +774,249 @@ def _wait_for_tee_table(driver: webdriver.Chrome, log: logging.Logger, timeout: 
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FALLBACK: Book Group → Yes  (pre-configured group, handle already-booked)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def execute_bookgroup_yes_fallback(
+    driver: webdriver.Chrome,
+    username: str,
+    required_slots: int,
+    log: logging.Logger,
+) -> bool:
+    """
+    Fallback booking method: click BOOK GROUP → Yes (uses MiClub pre-configured group).
+
+    If MiClub raises an alert that a member is already booked:
+      - Dismiss the alert
+      - Navigate to the makeBooking page for the same row
+      - Find and remove the problematic player (click their red X)
+      - Confirm with the remaining players
+
+    Returns True on success.
+    """
+    log.info("▶ FALLBACK: Book Group → Yes method")
+    deadline = hard_deadline_sydney()
+    attempt  = 0
+
+    while attempt < BOOKING_MAX_ATTEMPTS and time.time() < deadline:
+        attempt += 1
+        log.info(f"Fallback attempt {attempt}...")
+
+        try:
+            if not _wait_for_tee_table(driver, log, timeout=60):
+                driver.refresh()
+                time.sleep(4)
+                continue
+
+            # Find first row with enough empty slots
+            rows = driver.find_elements(By.XPATH, "//div[contains(@class,'row-time')]")
+            target_row = None
+            for row in rows:
+                try:
+                    empties = row.find_elements(By.XPATH, ".//button[contains(@class,'btn-book-me')]")
+                    if len(empties) >= required_slots:
+                        target_row = row
+                        break
+                except StaleElementReferenceException:
+                    continue
+
+            if not target_row:
+                log.info("Fallback: no suitable row — refreshing")
+                driver.refresh()
+                time.sleep(3)
+                continue
+
+            try:
+                time_text = target_row.find_element(By.TAG_NAME, "h3").text
+            except Exception:
+                time_text = "(unknown)"
+            log.info(f"Fallback target slot: {time_text}")
+            snap(driver, f"fallback{attempt}_target_row", log)
+
+            # Click BOOK GROUP
+            btn = target_row.find_element(By.XPATH, ".//button[contains(@class,'btn-book-group')]")
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+            try:
+                btn.click()
+            except ElementClickInterceptedException:
+                driver.execute_script("arguments[0].click();", btn)
+            time.sleep(1)
+
+            # Dismiss any unexpected alert (slot taken)
+            alerted, alert_text = safe_accept_alert(driver)
+            if alerted:
+                log.warning(f"Fallback: slot alert ({alert_text}) — retrying")
+                driver.refresh()
+                time.sleep(2)
+                continue
+
+            # Click Yes on the "Book Your Playing Partners?" modal
+            try:
+                yes_btn = WebDriverWait(driver, 10).until(
+                    EC.element_to_be_clickable(
+                        (By.XPATH, "//button[normalize-space()='Yes'] | //a[normalize-space()='Yes']")
+                    )
+                )
+                snap(driver, f"fallback{attempt}_group_modal", log)
+                try:
+                    yes_btn.click()
+                except ElementClickInterceptedException:
+                    driver.execute_script("arguments[0].click();", yes_btn)
+                log.info("Fallback: clicked Yes on group modal")
+                time.sleep(1.5)
+            except TimeoutException:
+                log.warning("Fallback: group modal not found — may have gone direct")
+
+            # Check for "already booked" alert
+            alerted, alert_text = safe_accept_alert(driver)
+            if alerted:
+                already_booked_phrases = [
+                    "already booked", "already has a booking",
+                    "existing booking", "already registered",
+                ]
+                if any(p in alert_text.lower() for p in already_booked_phrases):
+                    log.warning(f"Fallback: member already booked ({alert_text}). Switching to makeBooking page...")
+                    snap(driver, f"fallback{attempt}_already_booked_alert", log)
+                    # If we're still on the tee sheet, try again via No → manual remove
+                    if has_tee_sheet(driver) or "makeBooking" not in driver.current_url:
+                        # Click Book Group on the same/next slot and go via No path
+                        try:
+                            rows2 = driver.find_elements(By.XPATH, "//div[contains(@class,'row-time')]")
+                            for row2 in rows2:
+                                empties2 = row2.find_elements(By.XPATH, ".//button[contains(@class,'btn-book-me')]")
+                                if len(empties2) >= required_slots:
+                                    btn2 = row2.find_element(By.XPATH, ".//button[contains(@class,'btn-book-group')]")
+                                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn2)
+                                    btn2.click()
+                                    time.sleep(1)
+                                    safe_accept_alert(driver)
+                                    no_btn = WebDriverWait(driver, 8).until(
+                                        EC.element_to_be_clickable(
+                                            (By.XPATH, "//button[normalize-space()='No'] | //a[normalize-space()='No']")
+                                        )
+                                    )
+                                    no_btn.click()
+                                    log.info("Fallback: switched to makeBooking via No path to remove already-booked player")
+                                    break
+                        except Exception as e2:
+                            log.warning(f"Fallback: could not switch to No path: {e2}")
+                            driver.get(EVENT_LIST_URL)
+                            time.sleep(2)
+                            continue
+
+                    # On makeBooking page — find player fields with errors and remove them
+                    try:
+                        WebDriverWait(driver, 10).until(lambda d: "makeBooking" in d.current_url)
+                        time.sleep(1)
+                        snap(driver, f"fallback{attempt}_makebooking_remove", log)
+                        # Remove any player showing an error (red background / error class)
+                        # Common patterns: the field has an error style or the row has an error indicator
+                        error_fields = driver.find_elements(
+                            By.XPATH,
+                            "//*[contains(@class,'error') or contains(@class,'invalid') or "
+                            "contains(@class,'ui-state-error')]//input | "
+                            "//input[contains(@class,'error') or contains(@class,'invalid')]"
+                        )
+                        for ef in error_fields:
+                            if ef.is_displayed():
+                                # Find the remove/X button nearby
+                                try:
+                                    parent = ef.find_element(By.XPATH, "./ancestor::td[1] | ./ancestor::div[1]")
+                                    remove = parent.find_element(
+                                        By.XPATH,
+                                        ".//a[contains(@class,'remove') or contains(@onclick,'remove') or "
+                                        "@title='Remove'] | .//button[contains(@class,'remove')]"
+                                    )
+                                    remove.click()
+                                    log.info("Fallback: removed already-booked player from slot")
+                                    time.sleep(0.5)
+                                except Exception:
+                                    # Try clearing the field
+                                    try:
+                                        ef.clear()
+                                        ef.send_keys(Keys.DELETE)
+                                    except Exception:
+                                        pass
+
+                        snap(driver, f"fallback{attempt}_after_remove", log)
+                        # Confirm with remaining players
+                        confirm = WebDriverWait(driver, 8).until(
+                            EC.element_to_be_clickable(
+                                (By.XPATH,
+                                 "//a[normalize-space()='Confirm Booking'] | "
+                                 "//button[normalize-space()='Confirm Booking']")
+                            )
+                        )
+                        confirm.click()
+                        time.sleep(1.5)
+                        snap(driver, f"fallback{attempt}_post_confirm_remove", log)
+                        alerted2, alert_text2 = safe_accept_alert(driver)
+                        if has_tee_sheet(driver) or alerted2:
+                            log.info("✅ Fallback: booked (after removing already-booked player)")
+                            return True
+                    except Exception as e3:
+                        log.warning(f"Fallback: remove-and-rebook failed: {e3}")
+                        driver.get(EVENT_LIST_URL)
+                        time.sleep(2)
+                        continue
+                else:
+                    log.warning(f"Fallback: unexpected alert after Yes: {alert_text}")
+                    driver.get(EVENT_LIST_URL)
+                    time.sleep(2)
+                    continue
+
+            # No alert — check for success
+            snap(driver, f"fallback{attempt}_post_yes", log)
+            try:
+                body_text = driver.find_element(By.TAG_NAME, "body").text
+            except Exception:
+                body_text = ""
+            success_phrases = [
+                "booking has been made", "successfully booked",
+                "booking successful", "booking confirmed",
+            ]
+            if any(p in body_text.lower() for p in success_phrases):
+                log.info("✅ Fallback: booking confirmed (page text).")
+                return True
+            if has_tee_sheet(driver):
+                log.info("✅ Fallback: redirected to tee sheet — assuming success.")
+                return True
+            # Might be on makeBooking page (modal went direct to booking form)
+            if "makeBooking" in driver.current_url:
+                try:
+                    confirm = WebDriverWait(driver, 8).until(
+                        EC.element_to_be_clickable(
+                            (By.XPATH,
+                             "//a[normalize-space()='Confirm Booking'] | "
+                             "//button[normalize-space()='Confirm Booking']")
+                        )
+                    )
+                    confirm.click()
+                    time.sleep(1.5)
+                    alerted3, _ = safe_accept_alert(driver)
+                    if has_tee_sheet(driver) or alerted3:
+                        log.info("✅ Fallback: booking confirmed via makeBooking confirm.")
+                        return True
+                except Exception:
+                    pass
+
+            driver.get(EVENT_LIST_URL)
+            time.sleep(2)
+
+        except Exception as exc:
+            log.error(f"Fallback attempt {attempt} error: {exc}")
+            snap(driver, f"fallback{attempt}_crash", log)
+            try:
+                driver.refresh()
+            except Exception:
+                driver.get(EVENT_LIST_URL)
+            time.sleep(5)
+
+    log.error("Fallback booking also failed.")
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # GROUP HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 def get_fourball_partners(username: str) -> List[str]:
@@ -831,35 +1074,44 @@ def worker(
         # ── Attempt 4-ball ────────────────────────────────────────────────
         if not fourball_booked.is_set():
             partners_4 = get_fourball_partners(username)
-            log.info(f"Attempting 4-ball. Adding: {partners_4}")
+            log.info(f"Attempting 4-ball (search method). Adding: {partners_4}")
             success = execute_search_booking(driver, username, partners_4, 4, log)
-            if success:
+
+            if not success and not fourball_booked.is_set():
+                log.warning("Search booking failed — trying Book Group → Yes fallback")
+                success = execute_bookgroup_yes_fallback(driver, username, 4, log)
+
+            if success and not fourball_booked.is_set():
                 fourball_booked.set()
                 with fourball_winner_val.get_lock():
                     fourball_winner_val.value = username.encode()[:64]
                 log.info(f"🏆 4-ball booked by {username}!")
                 logout(driver, log)
                 return
-            log.info("4-ball attempt failed or slot taken — falling back to 2-ball")
+            log.info("4-ball attempt complete (may have been taken by another worker)")
         else:
             log.info("4-ball already booked by another worker — going straight to 2-ball")
 
         # ── Attempt 2-ball ────────────────────────────────────────────────
         if not twoball_booked.is_set():
-            # Determine who won the 4-ball to work out remaining players
             try:
                 winner = fourball_winner_val.value.decode().rstrip('\x00')
             except Exception:
                 winner = ""
             partners_2 = get_twoball_partner(username, winner)
-            log.info(f"Attempting 2-ball. Adding: {partners_2}")
+            log.info(f"Attempting 2-ball (search method). Adding: {partners_2}")
             success = execute_search_booking(driver, username, partners_2, 2, log)
-            if success:
+
+            if not success and not twoball_booked.is_set():
+                log.warning("Search booking failed for 2-ball — trying Book Group → Yes fallback")
+                success = execute_bookgroup_yes_fallback(driver, username, 2, log)
+
+            if success and not twoball_booked.is_set():
                 twoball_booked.set()
                 log.info(f"🏆 2-ball booked by {username}!")
                 logout(driver, log)
                 return
-            log.info("2-ball attempt failed — both bookings likely done by other workers")
+            log.info("2-ball attempt complete — both bookings likely handled by other workers")
         else:
             log.info("2-ball already booked — nothing left to do")
 
