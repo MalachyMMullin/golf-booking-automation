@@ -683,84 +683,51 @@ def _search_and_select_player(
 
 
 def _get_row_id(row) -> str:
-    """Extract booking_row_id from a tee-sheet row."""
-    pattern = re.compile(r"booking_row_id[=:](\d+)")
+    """Extract booking_row_id from a tee-sheet row.
 
-    def extract(value: str) -> str:
-        if not value:
-            return ""
-        match = pattern.search(value)
-        return match.group(1) if match else ""
+    MiClub HTML structure (confirmed from live page):
+      <div id="row-9454" class="row row-time ...">
+        <button id="btn-book-group-9454" onclick="javascript:checkAutomaticBook(261,9454,1,...)">
+
+    Three reliable sources, tried in order:
+      1. Row div id:   id="row-9454"           → strip "row-" prefix
+      2. Button onclick: checkAutomaticBook(261,9454,...) → 2nd argument
+      3. Button id:    id="btn-book-group-9454" → strip "btn-book-group-" prefix
+    """
+    # 1) Row div id — most direct: id="row-9454"
+    try:
+        row_id_attr = row.get_attribute("id") or ""
+        m = re.match(r"^row-(\d+)$", row_id_attr)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
 
     btn = None
     try:
         btn = row.find_element(By.XPATH, ".//button[contains(@class,'btn-book-group')]")
     except Exception:
-        btn = None
+        pass
 
-    # 1) Button onclick attribute
+    # 2) Button onclick: checkAutomaticBook(261,9454,1,...) — 2nd arg is row id
     if btn is not None:
         try:
-            rid = extract(btn.get_attribute("onclick") or "")
-            if rid:
-                return rid
+            onclick = btn.get_attribute("onclick") or ""
+            m = re.search(r"checkAutomaticBook\(\s*\d+\s*,\s*(\d+)\s*,", onclick)
+            if m:
+                return m.group(1)
         except Exception:
             pass
 
-    # 2) Any data-* attribute on the button
+    # 3) Button id: id="btn-book-group-9454"
     if btn is not None:
         try:
-            attr_names = row.parent.execute_script(
-                "return arguments[0].getAttributeNames ? arguments[0].getAttributeNames() : [];",
-                btn,
-            ) or []
-            for name in attr_names:
-                if not name.startswith("data-"):
-                    continue
-                value = btn.get_attribute(name) or ""
-                rid = extract(value) or extract(f"{name}={value}")
-                if rid:
-                    return rid
+            btn_id = btn.get_attribute("id") or ""
+            m = re.match(r"^btn-book-group-(\d+)$", btn_id)
+            if m:
+                return m.group(1)
         except Exception:
             pass
-
-    # 3) href of any nearby <a> tag in the row
-    try:
-        links = row.find_elements(By.XPATH, ".//a[@href]")
-        for link in links:
-            rid = extract(link.get_attribute("href") or "")
-            if rid:
-                return rid
-    except Exception:
-        pass
-
-    # 4) Row element itself (class, id, or data-*)
-    try:
-        rid = extract(row.get_attribute("id") or "")
-        if rid:
-            return rid
-    except Exception:
-        pass
-    try:
-        rid = extract(row.get_attribute("class") or "")
-        if rid:
-            return rid
-    except Exception:
-        pass
-    try:
-        row_attr_names = row.parent.execute_script(
-            "return arguments[0].getAttributeNames ? arguments[0].getAttributeNames() : [];",
-            row,
-        ) or []
-        for name in row_attr_names:
-            if not name.startswith("data-"):
-                continue
-            value = row.get_attribute(name) or ""
-            rid = extract(value) or extract(f"{name}={value}")
-            if rid:
-                return rid
-    except Exception:
-        pass
 
     return ""
 
