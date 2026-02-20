@@ -682,6 +682,89 @@ def _search_and_select_player(
         return False
 
 
+def _get_row_id(row) -> str:
+    """Extract booking_row_id from a tee-sheet row."""
+    pattern = re.compile(r"booking_row_id[=:](\d+)")
+
+    def extract(value: str) -> str:
+        if not value:
+            return ""
+        match = pattern.search(value)
+        return match.group(1) if match else ""
+
+    btn = None
+    try:
+        btn = row.find_element(By.XPATH, ".//button[contains(@class,'btn-book-group')]")
+    except Exception:
+        btn = None
+
+    # 1) Button onclick attribute
+    if btn is not None:
+        try:
+            rid = extract(btn.get_attribute("onclick") or "")
+            if rid:
+                return rid
+        except Exception:
+            pass
+
+    # 2) Any data-* attribute on the button
+    if btn is not None:
+        try:
+            attr_names = row.parent.execute_script(
+                "return arguments[0].getAttributeNames ? arguments[0].getAttributeNames() : [];",
+                btn,
+            ) or []
+            for name in attr_names:
+                if not name.startswith("data-"):
+                    continue
+                value = btn.get_attribute(name) or ""
+                rid = extract(value) or extract(f"{name}={value}")
+                if rid:
+                    return rid
+        except Exception:
+            pass
+
+    # 3) href of any nearby <a> tag in the row
+    try:
+        links = row.find_elements(By.XPATH, ".//a[@href]")
+        for link in links:
+            rid = extract(link.get_attribute("href") or "")
+            if rid:
+                return rid
+    except Exception:
+        pass
+
+    # 4) Row element itself (class, id, or data-*)
+    try:
+        rid = extract(row.get_attribute("id") or "")
+        if rid:
+            return rid
+    except Exception:
+        pass
+    try:
+        rid = extract(row.get_attribute("class") or "")
+        if rid:
+            return rid
+    except Exception:
+        pass
+    try:
+        row_attr_names = row.parent.execute_script(
+            "return arguments[0].getAttributeNames ? arguments[0].getAttributeNames() : [];",
+            row,
+        ) or []
+        for name in row_attr_names:
+            if not name.startswith("data-"):
+                continue
+            value = row.get_attribute(name) or ""
+            rid = extract(value) or extract(f"{name}={value}")
+            if rid:
+                return rid
+    except Exception:
+        pass
+
+    return ""
+
+
 def execute_search_booking(
     driver: webdriver.Chrome,
     username: str,
@@ -689,7 +772,8 @@ def execute_search_booking(
     required_slots: int,
     log: logging.Logger,
     max_attempts: int = BOOKING_MAX_ATTEMPTS,
-) -> bool:
+    skip_row_ids: Optional[set] = None,
+) -> Tuple[bool, str]:
     """
     Find a slot with enough empty spaces, click Book Group, click No on the modal,
     then on makeBooking.xhtml add each partner by member-number search, and confirm.
@@ -703,6 +787,7 @@ def execute_search_booking(
     attempt = 0
     while attempt < max_attempts and time.time() < deadline:
         attempt += 1
+        row_id = ""
         mins_remaining = max(0, (deadline - time.time()) / 60)
         log.info(f"Booking attempt {attempt} ({mins_remaining:.0f} min until 8pm timeout)...")
 
@@ -719,9 +804,17 @@ def execute_search_booking(
             for row in rows:
                 try:
                     empties = row.find_elements(By.XPATH, ".//button[contains(@class,'btn-book-me')]")
-                    if len(empties) >= required_slots:
-                        target_row = row
-                        break
+                    if len(empties) < required_slots:
+                        continue
+                    candidate_row_id = _get_row_id(row)
+                    if skip_row_ids and candidate_row_id and candidate_row_id in skip_row_ids:
+                        log.info(
+                            f"Skipping row_id={candidate_row_id} (already booked by another group) — trying next row"
+                        )
+                        continue
+                    target_row = row
+                    row_id = candidate_row_id
+                    break
                 except StaleElementReferenceException:
                     continue
 
@@ -930,16 +1023,16 @@ def execute_search_booking(
             ]
             if alerted and any(p in alert_text.lower() for p in success_phrases):
                 log.info(f"✅ BOOKED via alert: {alert_text}")
-                return True
+                return True, row_id
             if any(p in body_text.lower() for p in success_phrases):
                 log.info("✅ BOOKED (page text confirms).")
-                return True
+                return True, row_id
 
             # Redirect back to tee sheet often means success
             if has_tee_sheet(driver):
                 log.info("✅ Redirected to tee sheet — assuming booking succeeded.")
                 snap(driver, f"attempt{attempt}_teesheet_post_confirm", log)
-                return True
+                return True, row_id
 
             # Slot may have been taken mid-booking
             if alerted and alert_text:
@@ -949,7 +1042,7 @@ def execute_search_booking(
                 continue
 
             log.warning("Booking status unclear — assuming success to avoid double-booking")
-            return True
+            return True, row_id
 
         except StaleElementReferenceException:
             log.warning("Stale element — refreshing")
@@ -970,7 +1063,7 @@ def execute_search_booking(
             time.sleep(5)
 
     log.error(f"Failed to book after {max_attempts} attempts.")
-    return False
+    return False, ""
 
 
 def _wait_for_tee_table(driver: webdriver.Chrome, log: logging.Logger, timeout: int = 60) -> bool:
@@ -1271,6 +1364,7 @@ def worker(
     fourball_booked: multiprocessing.Event,
     twoball_booked: multiprocessing.Event,
     fourball_winner_val: multiprocessing.Value,
+    fourball_row_id_val: multiprocessing.Value,
 ) -> None:
     log = make_worker_logger(username)
     log.info(f"Worker started. Target: {target_day} {target_date}")
@@ -1294,7 +1388,7 @@ def worker(
         if not fourball_booked.is_set():
             partners_4 = get_fourball_partners(username)
             log.info(f"Attempting 4-ball (search method). Adding: {partners_4}")
-            success = execute_search_booking(driver, username, partners_4, 4, log)
+            success, row_id = execute_search_booking(driver, username, partners_4, 4, log)
 
             if not success and not fourball_booked.is_set():
                 log.warning("Search booking failed — trying Book Group → Yes fallback")
@@ -1304,6 +1398,10 @@ def worker(
                 fourball_booked.set()
                 try:
                     fourball_winner_val.value = username.encode()[:64]
+                except Exception:
+                    pass
+                try:
+                    fourball_row_id_val.value = row_id.encode()[:64]
                 except Exception:
                     pass
                 log.info(f"🏆 4-ball booked by {username}!")
@@ -1326,8 +1424,23 @@ def worker(
             except Exception:
                 winner = ""
             partners_2 = get_twoball_partner(username, winner)
+            try:
+                skip_ids = set()
+                frid = fourball_row_id_val.value.decode().rstrip("\x00")
+                if frid:
+                    skip_ids.add(frid)
+                    log.info(f"2-ball will skip row_id={frid} (used by 4-ball)")
+            except Exception:
+                skip_ids = set()
             log.info(f"Attempting 2-ball (search method). Adding: {partners_2}")
-            success = execute_search_booking(driver, username, partners_2, 2, log)
+            success, _ = execute_search_booking(
+                driver,
+                username,
+                partners_2,
+                2,
+                log,
+                skip_row_ids=skip_ids,
+            )
 
             if not success and not twoball_booked.is_set():
                 log.warning("Search booking failed for 2-ball — trying Book Group → Yes fallback")
@@ -1440,7 +1553,7 @@ def verify_bookings(
                 partners = [name_to_member[n.lower()] for n in missing_in_4ball
                            if n.lower() in name_to_member and name_to_member[n.lower()] != verifier["username"]]
                 if partners:
-                    execute_search_booking(driver, verifier["username"], partners, len(partners) + 1, log)
+                    _, _ = execute_search_booking(driver, verifier["username"], partners, len(partners) + 1, log)
 
             if missing_in_2ball and retry_twoball:
                 log.info(f"Re-attempting 2-ball for missing: {missing_in_2ball}")
@@ -1452,7 +1565,7 @@ def verify_bookings(
                 partners = [name_to_member[n.lower()] for n in missing_in_2ball
                            if n.lower() in name_to_member and name_to_member[n.lower()] != verifier["username"]]
                 if partners:
-                    execute_search_booking(driver, verifier["username"], partners, len(partners) + 1, log)
+                    _, _ = execute_search_booking(driver, verifier["username"], partners, len(partners) + 1, log)
 
         logout(driver, log)
 
@@ -1548,6 +1661,7 @@ def main() -> None:
         fourball_booked    = manager.Event()
         twoball_booked     = manager.Event()
         fourball_winner_val = manager.Value(bytes, b"")
+        fourball_row_id_val = manager.Value(bytes, b"")
 
         processes = []
         for user in ALL_USERS:
@@ -1561,6 +1675,7 @@ def main() -> None:
                     fourball_booked,
                     twoball_booked,
                     fourball_winner_val,
+                    fourball_row_id_val,
                 ),
                 name=f"worker-{user['username']}",
             )
