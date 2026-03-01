@@ -453,7 +453,7 @@ def navigate_and_wait_for_tee_sheet(
 # ─────────────────────────────────────────────────────────────────────────────
 # NEW: SEARCH-BASED BOOKING  (makeBooking.xhtml flow)
 # ─────────────────────────────────────────────────────────────────────────────
-def _find_empty_player_inputs(driver: webdriver.Chrome) -> list:
+def _find_empty_player_inputs(driver: webdriver.Chrome, log: Optional[logging.Logger] = None) -> list:
     """
     Return empty player search input fields on the makeBooking page.
     MiClub (PrimeFaces) uses class 'ui-autocomplete-input' with placeholder 'Type Name'.
@@ -464,12 +464,19 @@ def _find_empty_player_inputs(driver: webdriver.Chrome) -> list:
         selectors = [
             "//input[contains(@class,'ui-autocomplete-input') and not(@type='hidden')]",
             # Fallback: placeholder-based (MiClub uses 'Type Name', not 'Find Player')
-            "//input[contains(@placeholder,'Type Name') or contains(@placeholder,'type name')]",
+            "//input[contains(@placeholder,'Type Name') or contains(@placeholder,'type name') "
+            "or contains(@placeholder,'Find Player') or contains(@placeholder,'find player')]",
             "//input[@type='text' and (contains(@class,'inputfield') or contains(@class,'autocomplete'))]",
+            # Broad fallback: any visible text input that isn't the logged-in user's pre-filled field
+            "//input[@type='text' and not(@disabled) and not(@readonly)]",
         ]
-        for sel in selectors:
+        for idx, sel in enumerate(selectors):
             inputs = driver.find_elements(By.XPATH, sel)
-            empties = [i for i in inputs if i.is_displayed() and not (i.get_attribute("value") or "").strip()]
+            visible = [i for i in inputs if i.is_displayed()]
+            empties = [i for i in visible if not (i.get_attribute("value") or "").strip()]
+            if log:
+                log.info(f"_find_empty_player_inputs: selector[{idx}] matched {len(visible)} visible, "
+                         f"{len(empties)} empty")
             if empties:
                 return empties
         return []
@@ -847,6 +854,16 @@ def execute_search_booking(
             log.info(f"makeBooking page loaded: {driver.current_url}")
             snap(driver, f"attempt{attempt}_makebooking_loaded", log)
 
+            # Double-check: extract row_id from URL and verify it's not in skip set
+            if skip_row_ids:
+                url_match = re.search(r"booking_row_id=(\d+)", driver.current_url)
+                if url_match and url_match.group(1) in skip_row_ids:
+                    log.warning(f"URL row_id={url_match.group(1)} is in skip set — "
+                                f"cancelling and trying a different row")
+                    driver.get(EVENT_LIST_URL)
+                    time.sleep(3)
+                    continue
+
             # Log reservation timer if visible
             try:
                 body_text = driver.find_element(By.TAG_NAME, "body").text
@@ -871,7 +888,7 @@ def execute_search_booking(
             log.info(f"Checkbox strategy: ticked {ticked}/{len(partners_to_add)} partners")
 
             # Check how many Find Player inputs are still empty after checkboxes
-            still_empty = _find_empty_player_inputs(driver)
+            still_empty = _find_empty_player_inputs(driver, log)
             log.info(f"Empty Find Player inputs remaining after checkboxes: {len(still_empty)} "
                      f"(need {len(partners_to_add) - ticked} more via search)")
 
@@ -888,12 +905,13 @@ def execute_search_booking(
 
             # Strategy B: autocomplete search for any partners not yet added
             remaining_partners = partners_to_add[ticked:] if ticked < len(partners_to_add) else []
+            partners_added_by_search = 0
 
             # If a member is already in the tee sheet / already booked,
             # skip them and fill the slot with the next available partner.
             skipped: List[str] = []
             for member_num in remaining_partners:
-                empty_inputs = _find_empty_player_inputs(driver)
+                empty_inputs = _find_empty_player_inputs(driver, log)
                 if not empty_inputs:
                     log.info("No more empty Find Player slots — all filled.")
                     break
@@ -902,6 +920,7 @@ def execute_search_booking(
                     log.warning(f"Could not add {member_num} (may already be booked) — skipping")
                     skipped.append(member_num)
                     continue
+                partners_added_by_search += 1
                 time.sleep(0.5)
 
                 # Check for "already booked" error message after adding
@@ -913,6 +932,7 @@ def execute_search_booking(
                     ]
                     if any(p in body.lower() for p in already_booked_phrases):
                         log.warning(f"Player {member_num} already has a booking — removing and skipping")
+                        partners_added_by_search -= 1
                         # Try to remove them (click the red X next to their name)
                         try:
                             remove_btns = driver.find_elements(
@@ -933,11 +953,13 @@ def execute_search_booking(
             if skipped:
                 log.info(f"Skipped already-booked members: {skipped}. Proceeding with remaining players.")
 
-            # We need at least 1 partner added (plus self = 2 minimum)
-            empty_remaining = _find_empty_player_inputs(driver)
-            total_filled = (required_slots - 1) - len(empty_remaining)  # -1 because Player 1 is self
-            if total_filled < 1 and required_slots > 1:
-                log.warning("No partners could be added at all — cancelling and retrying slot")
+            # Safety check: use explicit count of partners added, not empty-input inference
+            total_partners_added = ticked + partners_added_by_search
+            log.info(f"Partner tally: {total_partners_added}/{len(partners_to_add)} "
+                     f"(checkbox={ticked}, search={partners_added_by_search})")
+            if total_partners_added < 1 and required_slots > 1:
+                log.warning(f"Only {total_partners_added} partners added (need at least 1) "
+                            f"— cancelling and retrying slot")
                 try:
                     cancel = driver.find_element(
                         By.XPATH,
@@ -1393,11 +1415,16 @@ def worker(
             partners_2 = get_twoball_partner(username, winner)
             try:
                 skip_ids = set()
-                frid = fourball_row_id_val.value.decode().rstrip("\x00")
+                raw = fourball_row_id_val.value
+                log.info(f"Reading fourball_row_id_val: raw={raw!r}")
+                frid = raw.decode().rstrip("\x00") if raw else ""
                 if frid:
                     skip_ids.add(frid)
                     log.info(f"2-ball will skip row_id={frid} (used by 4-ball)")
-            except Exception:
+                else:
+                    log.warning("fourball_row_id_val is empty — cannot skip 4-ball row")
+            except Exception as exc:
+                log.warning(f"Failed to read fourball_row_id_val: {exc}")
                 skip_ids = set()
             log.info(f"Attempting 2-ball (search method). Adding: {partners_2}")
             success, _ = execute_search_booking(
@@ -1505,9 +1532,9 @@ def verify_bookings(
             # Determine which group they belong to and attempt re-booking
             # Use current driver (already logged in as verifier)
             missing_in_4ball = [m for m in result["missing"]
-                                if any(m.lower() in ["mullin","hillard","rutherford","rudge"])]
+                                if m.lower() in ["mullin","hillard","rutherford","rudge"]]
             missing_in_2ball = [m for m in result["missing"]
-                                if any(m.lower() in ["lalor","cheney"])]
+                                if m.lower() in ["lalor","cheney"]]
 
             if missing_in_4ball and retry_fourball:
                 log.info(f"Re-attempting 4-ball for missing: {missing_in_4ball}")
