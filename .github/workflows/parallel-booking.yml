@@ -2,10 +2,10 @@ name: Thursday golf booking - Parallel (all 6 users)
 
 on:
   schedule:
-    # 07:00 UTC Thursday = 18:00 AEDT (UTC+11, Oct–Apr) / 17:00 AEST (UTC+10, Apr–Oct)
-    # The script waits internally until 18:00 Sydney time before logging in,
+    # 06:00 UTC Thursday = 17:00 AEDT (UTC+11, Oct–Apr) / 16:00 AEST (UTC+10, Apr–Oct)
+    # The script waits internally until 17:00 Sydney time before logging in,
     # so this handles both AEDT and AEST automatically.
-    - cron: "0 7 * * 4"
+    - cron: "0 6 * * 4"
   workflow_dispatch: {}  # Manual trigger only — targets next-next Saturday automatically
 
 jobs:

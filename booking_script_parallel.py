@@ -89,7 +89,7 @@ LOGIN_URL      = "https://macquarielinks.miclub.com.au/security/login.msp"
 EVENT_LIST_URL = "https://macquarielinks.miclub.com.au/views/members/booking/eventList.xhtml"
 LOGOUT_URL     = "https://macquarielinks.miclub.com.au/security/logout.msp"
 
-LOGIN_TIME        = (18,  0)  # login at 6:00pm Sydney
+LOGIN_TIME        = (17,  0)  # login at 5:00pm Sydney
 QUEUE_JOIN_TIME   = (18, 30)  # ballot opens at 6:30pm — click event link here
 BOOKING_OPEN_TIME = (19,  0)  # tee sheet releases at 7:00pm
 HARD_TIMEOUT_TIME = (20,  0)  # give up at 8:00pm — no earlier
