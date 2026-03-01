@@ -14,7 +14,7 @@ jobs:
     timeout-minutes: 150
     concurrency:
       group: golf-booking-parallel
-      cancel-in-progress: true
+      cancel-in-progress: false
     env:
       TZ: Australia/Sydney
       GOLFBOT_RUN_ROOT: ${{ github.workspace }}/golfbot_logs
