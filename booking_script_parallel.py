@@ -87,6 +87,7 @@ ALL_USERS = [
 # ─────────────────────────────────────────────────────────────────────────────
 LOGIN_URL      = "https://macquarielinks.miclub.com.au/security/login.msp"
 EVENT_LIST_URL = "https://macquarielinks.miclub.com.au/views/members/booking/eventList.xhtml"
+HOME_URL       = "https://macquarielinks.miclub.com.au/views/members/home.xhtml"
 LOGOUT_URL     = "https://macquarielinks.miclub.com.au/security/logout.msp"
 
 LOGIN_TIME        = (17,  0)  # login at 5:00pm Sydney
@@ -95,6 +96,7 @@ BOOKING_OPEN_TIME = (19,  0)  # tee sheet releases at 7:00pm
 HARD_TIMEOUT_TIME = (20,  0)  # give up at 8:00pm — no earlier
 
 OPEN_POLL_INTERVAL = 15  # seconds between event-list refreshes before draw (6 workers × 15s = low load)
+KEEPALIVE_INTERVAL = 300  # seconds between session keepalive navigations (5 min)
 BOOKING_MAX_ATTEMPTS = 999  # effectively unlimited — hard deadline is HARD_TIMEOUT_TIME
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -319,8 +321,13 @@ def navigate_and_wait_for_tee_sheet(
     target_day: str,
     target_date: str,
     log: logging.Logger,
+    username: str = "",
+    password: str = "",
 ) -> bool:
     """Enter draw/queue and wait for tee sheet. Does NOT refresh once in draw/queue."""
+    # Store credentials for keepalive re-login
+    _keepalive_username = username
+    _keepalive_password = password
     log.info("Navigating to event list...")
     driver.get(EVENT_LIST_URL)
 
@@ -328,6 +335,7 @@ def navigate_and_wait_for_tee_sheet(
     draw_attempted   = False
     deadline         = hard_deadline_sydney()   # hard stop at 8pm Sydney
     last_status_log  = 0.0
+    last_keepalive   = time.time()
 
     while time.time() < deadline:
         now = time.time()
@@ -428,6 +436,31 @@ def navigate_and_wait_for_tee_sheet(
             if now - last_status_log > 30:
                 log.info(f"Waiting for draw time ({QUEUE_JOIN_TIME[0]:02d}:{QUEUE_JOIN_TIME[1]:02d}) — {secs_to_draw:.0f}s away...")
                 last_status_log = now
+
+            # Session keepalive: navigate to home page and back every 5 min
+            # to prevent MiClub from expiring idle sessions
+            if now - last_keepalive > KEEPALIVE_INTERVAL and secs_to_draw > 60:
+                log.info("Session keepalive: navigating to home page and back")
+                try:
+                    driver.get(HOME_URL)
+                    time.sleep(2)
+                    # Verify still logged in
+                    try:
+                        driver.find_element(By.XPATH, "//a[contains(@href,'logout')]")
+                        log.info("Keepalive OK — session active")
+                    except Exception:
+                        log.warning("Session may have expired — re-logging in")
+                        if not login(driver, _keepalive_username, _keepalive_password, log):
+                            log.error("Re-login failed during keepalive")
+                    driver.get(EVENT_LIST_URL)
+                    time.sleep(2)
+                except Exception as exc:
+                    log.warning(f"Keepalive navigation error: {exc}")
+                    driver.get(EVENT_LIST_URL)
+                    time.sleep(2)
+                last_keepalive = now
+                continue
+
             time.sleep(poll_interval)
             driver.refresh()
             safe_accept_alert(driver)
@@ -1081,6 +1114,7 @@ def execute_bookgroup_yes_fallback(
     username: str,
     required_slots: int,
     log: logging.Logger,
+    skip_row_ids: Optional[set] = None,
 ) -> bool:
     """
     Fallback booking method: click BOOK GROUP → Yes (uses MiClub pre-configured group).
@@ -1114,6 +1148,10 @@ def execute_bookgroup_yes_fallback(
                 try:
                     empties = row.find_elements(By.XPATH, ".//button[contains(@class,'btn-book-me')]")
                     if len(empties) >= required_slots:
+                        candidate_id = _get_row_id(row)
+                        if skip_row_ids and candidate_id and candidate_id in skip_row_ids:
+                            log.info(f"Fallback: skipping row_id={candidate_id} (used by another group)")
+                            continue
                         target_row = row
                         break
                 except StaleElementReferenceException:
@@ -1369,7 +1407,7 @@ def worker(
             log.error("Login failed — exiting worker")
             return
 
-        if not navigate_and_wait_for_tee_sheet(driver, target_day, target_date, log):
+        if not navigate_and_wait_for_tee_sheet(driver, target_day, target_date, log, username, password):
             log.error("Could not reach tee sheet — exiting worker")
             return
 
@@ -1438,7 +1476,7 @@ def worker(
 
             if not success and not twoball_booked.is_set():
                 log.warning("Search booking failed for 2-ball — trying Book Group → Yes fallback")
-                success = execute_bookgroup_yes_fallback(driver, username, 2, log)
+                success = execute_bookgroup_yes_fallback(driver, username, 2, log, skip_row_ids=skip_ids)
 
             if success and not twoball_booked.is_set():
                 twoball_booked.set()
@@ -1489,7 +1527,8 @@ def verify_bookings(
             log.error("Verification: could not log in")
             return result
 
-        if not navigate_and_wait_for_tee_sheet(driver, target_day, target_date, log):
+        if not navigate_and_wait_for_tee_sheet(driver, target_day, target_date, log,
+                                               verifier["username"], verifier["password"]):
             log.error("Verification: tee sheet not reachable")
             return result
 
