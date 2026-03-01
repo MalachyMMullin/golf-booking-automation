@@ -25,6 +25,8 @@ import smtplib
 import subprocess
 import time
 import zipfile
+from email.mime.base import MIMEBase
+from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta, timezone
@@ -1517,7 +1519,7 @@ def verify_bookings(
     If players are missing, attempts to rebook them.
     """
     log.info("=== VERIFICATION: Checking tee sheet for all 6 players ===")
-    result = {"confirmed": [], "missing": [], "tee_times": []}
+    result = {"confirmed": [], "missing": [], "tee_times": [], "screenshots": []}
 
     verifier = ALL_USERS[0]  # Use first account to verify
     driver = None
@@ -1541,9 +1543,9 @@ def verify_bookings(
             return result
 
         sheet_text = table.text
-        snap(driver, "verify_teesheet", log)
 
         log.info("─── Tee sheet contents ───")
+        our_row_idx = 0
         for row in rows:
             try:
                 t = row.find_element(By.TAG_NAME, "h3").text
@@ -1553,8 +1555,25 @@ def verify_bookings(
                     entry = f"{t}: {', '.join(names)}"
                     result["tee_times"].append(entry)
                     log.info(f"  {entry}")
+
+                    # Screenshot rows containing any of our players
+                    if any(s.lower() in " ".join(names).lower() for s in ALL_PLAYER_SURNAMES):
+                        our_row_idx += 1
+                        try:
+                            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", row)
+                            time.sleep(0.3)
+                            shot_path = RUN_DIR / f"verify_booking_{our_row_idx}.png"
+                            row.screenshot(str(shot_path))
+                            result["screenshots"].append(str(shot_path))
+                            log.info(f"  Screenshot: {shot_path.name}")
+                        except Exception as ss_exc:
+                            log.warning(f"  Row screenshot failed: {ss_exc}")
             except Exception:
                 continue
+
+        # Also take a full tee sheet screenshot
+        snap(driver, "verify_teesheet_full", log)
+        result["screenshots"].append(str(RUN_DIR / "verify_teesheet_full.png"))
 
         # Check each player surname
         for surname in ALL_PLAYER_SURNAMES:
@@ -1665,11 +1684,26 @@ def send_confirmation_email(
         msg["Subject"] = subject
         msg.attach(MIMEText(body, "plain"))
 
+        # Attach tee sheet screenshots
+        screenshots = result.get("screenshots", [])
+        for ss_path in screenshots:
+            try:
+                p = Path(ss_path)
+                if p.exists() and p.stat().st_size > 0:
+                    with open(p, "rb") as f:
+                        img = MIMEImage(f.read(), name=p.name)
+                    img.add_header("Content-Disposition", "attachment", filename=p.name)
+                    msg.attach(img)
+                    log.info(f"Attached screenshot: {p.name}")
+            except Exception as att_exc:
+                log.warning(f"Could not attach {ss_path}: {att_exc}")
+
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
             server.sendmail(GMAIL_USER, NOTIFICATION_EMAIL, msg.as_string())
 
-        log.info(f"✉️  Confirmation email sent to {NOTIFICATION_EMAIL}")
+        log.info(f"✉️  Confirmation email sent to {NOTIFICATION_EMAIL} "
+                 f"({len(screenshots)} screenshot(s) attached)")
     except Exception as exc:
         log.error(f"Email failed: {exc}")
 
