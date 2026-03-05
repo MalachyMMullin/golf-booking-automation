@@ -20,7 +20,7 @@ import logging
 import multiprocessing
 import os
 import re
-import shutil
+
 import smtplib
 import subprocess
 import time
@@ -269,10 +269,9 @@ def make_driver() -> webdriver.Chrome:
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-extensions")
     opts.add_argument("--window-size=1280,900")
-    opts.add_argument("--remote-debugging-pipe")
-    driver_path = shutil.which("chromedriver")
-    svc = Service(executable_path=driver_path) if driver_path else Service()
+    svc = Service()  # Selenium Manager auto-downloads matching chromedriver
     for attempt in range(1, 3):
         try:
             drv = webdriver.Chrome(options=opts, service=svc)
