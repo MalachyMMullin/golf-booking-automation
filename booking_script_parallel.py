@@ -295,7 +295,21 @@ def make_driver(log: Optional[logging.Logger] = None) -> webdriver.Chrome:
 # ─────────────────────────────────────────────────────────────────────────────
 def login(driver: webdriver.Chrome, username: str, password: str, log: logging.Logger) -> bool:
     log.info(f"Logging in...")
-    driver.get(LOGIN_URL)
+
+    # Retry loading the login page — MiClub may 403 on first attempt (IP rate limit)
+    for load_attempt in range(1, 4):
+        driver.get(LOGIN_URL)
+        time.sleep(2)
+        try:
+            page_text = driver.find_element(By.TAG_NAME, "body").text
+        except Exception:
+            page_text = ""
+        if "Forbidden" in page_text or "403" in driver.title:
+            log.warning(f"Login page returned 403 Forbidden (attempt {load_attempt}/3) — retrying in {load_attempt * 10}s")
+            time.sleep(load_attempt * 10)
+            continue
+        break
+
     try:
         uf = WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.NAME, "user")))
         uf.clear(); uf.send_keys(username)
@@ -1764,7 +1778,7 @@ def main() -> None:
             p.start()
             log.info(f"Started worker for {user['username']} (pid {p.pid})")
             processes.append(p)
-            time.sleep(0.5)  # stagger starts slightly
+            time.sleep(3)  # stagger starts to avoid 403 rate-limiting
 
         # Wait for both bookings to complete, or all workers to finish — hard stop at 8pm
         deadline = hard_deadline_sydney()
