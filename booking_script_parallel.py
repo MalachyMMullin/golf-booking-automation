@@ -263,7 +263,7 @@ def compute_target() -> Tuple[str, str]:
 # ─────────────────────────────────────────────────────────────────────────────
 # SELENIUM SETUP
 # ─────────────────────────────────────────────────────────────────────────────
-def make_driver() -> webdriver.Chrome:
+def make_driver(log: Optional[logging.Logger] = None) -> webdriver.Chrome:
     opts = Options()
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
@@ -276,6 +276,11 @@ def make_driver() -> webdriver.Chrome:
         try:
             drv = webdriver.Chrome(options=opts, service=svc)
             drv.set_page_load_timeout(90)
+            # Log resolved browser and driver versions
+            if log:
+                caps = drv.capabilities
+                log.info(f"Chrome version: {caps.get('browserVersion', 'unknown')}")
+                log.info(f"ChromeDriver version: {caps.get('chrome', {}).get('chromedriverVersion', 'unknown')}")
             return drv
         except Exception as exc:
             if attempt == 2:
@@ -299,9 +304,18 @@ def login(driver: webdriver.Chrome, username: str, password: str, log: logging.L
         driver.find_element(By.XPATH, "//input[@value='Login']").click()
         WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.XPATH, "//a[contains(@href,'logout')]")))
         log.info("Login successful")
+        snap(driver, f"login_ok_{username}", log)
         return True
     except Exception as exc:
         log.error(f"Login failed: {exc}")
+        snap(driver, f"login_fail_{username}", log)
+        # Dump page source for post-mortem
+        try:
+            src_path = RUN_DIR / f"login_fail_{username}.html"
+            src_path.write_text(driver.page_source, encoding="utf-8")
+            log.info(f"Page source saved: {src_path.name}")
+        except Exception as src_exc:
+            log.warning(f"Could not save page source: {src_exc}")
         return False
 
 
@@ -344,6 +358,7 @@ def navigate_and_wait_for_tee_sheet(
         if in_waiting_room:
             if has_tee_sheet(driver):
                 log.info("✅ Tee sheet visible!")
+                snap(driver, f"tee_sheet_visible_{username}", log)
                 return True
 
             in_draw, countdown = detect_draw(driver)
@@ -405,6 +420,7 @@ def navigate_and_wait_for_tee_sheet(
                 if in_draw or in_queue:
                     state = "draw" if in_draw else f"queue (pos {pos})"
                     log.info(f"Entered {state}.")
+                    snap(driver, f"entered_{state.replace(' ', '_')}_{username}", log)
                     in_waiting_room = True
                     continue
 
@@ -1399,7 +1415,7 @@ def worker(
 
     driver = None
     try:
-        driver = make_driver()
+        driver = make_driver(log=log)
 
         # Wait until 6:00pm Sydney before logging in
         wait_until_sydney(LOGIN_TIME[0], LOGIN_TIME[1], "Login gate", log)
@@ -1523,7 +1539,7 @@ def verify_bookings(
     verifier = ALL_USERS[0]  # Use first account to verify
     driver = None
     try:
-        driver = make_driver()
+        driver = make_driver(log=log)
         if not login(driver, verifier["username"], verifier["password"], log):
             log.error("Verification: could not log in")
             return result
