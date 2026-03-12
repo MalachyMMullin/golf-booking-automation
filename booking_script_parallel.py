@@ -16,19 +16,17 @@ CONFIG (top of file) ─ update before each season if group changes:
 
 from __future__ import annotations
 
+import json
 import logging
 import multiprocessing
 import os
+import random
 import re
 
-import smtplib
 import subprocess
 import time
+import urllib.request
 import zipfile
-from email.mime.base import MIMEBase
-from email.mime.image import MIMEImage
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from datetime import datetime, timedelta, timezone
 from multiprocessing.managers import SyncManager
 from pathlib import Path
@@ -66,22 +64,28 @@ FOUR_BALL_MEMBERS: List[str] = ["2007", "2008", "2009", "2010"]
 TWO_BALL_MEMBERS: List[str] = ["1101", "1107"]
 # Lalor=1101, Cheney=1107
 
-# Email notification (Gmail SMTP + App Password)
-NOTIFICATION_EMAIL = "malachy.m.mullin@gmail.com"
-GMAIL_USER         = os.getenv("GMAIL_USER", "")
-GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
-
 # Player surnames for tee-sheet verification (used after booking to confirm)
 ALL_PLAYER_SURNAMES = ["Mullin", "Hillard", "Rutherford", "Rudge", "Lalor", "Cheney"]
 
+# Member number → surname mapping (used for partner selection and error detection)
+MEMBER_TO_SURNAME = {
+    "2007": "Mullin",  "2008": "Hillard",
+    "2009": "Rutherford", "2010": "Rudge",
+    "1101": "Lalor",   "1107": "Cheney",
+}
+SURNAME_TO_MEMBER = {v.lower(): k for k, v in MEMBER_TO_SURNAME.items()}
+
 # All accounts that will enter the draw (credentials from env vars or defaults)
+# Worker order: 2-ball members interleaved early so they're on tee sheet
+# in time to grab the 2-ball after the 4-ball winner is decided.
+# Stagger: 0s, 8m, 16m, 24m, 32m, 40m → all logged in by ~5:55pm
 ALL_USERS = [
     {"username": os.getenv("MIGOLF_USER_1", "2007"), "password": os.getenv("MIGOLF_PASS_1", "Golf123#")},
-    {"username": os.getenv("MIGOLF_USER_2", "1107"), "password": os.getenv("MIGOLF_PASS_2", "Golf123#")},
+    {"username": os.getenv("MIGOLF_USER_2", "1101"), "password": os.getenv("MIGOLF_PASS_2", "Golf123#")},
     {"username": os.getenv("MIGOLF_USER_3", "2008"), "password": os.getenv("MIGOLF_PASS_3", "Golf123#")},
-    {"username": os.getenv("MIGOLF_USER_4", "2009"), "password": os.getenv("MIGOLF_PASS_4", "Golf123#")},
-    {"username": os.getenv("MIGOLF_USER_5", "2010"), "password": os.getenv("MIGOLF_PASS_5", "Golf123#")},
-    {"username": os.getenv("MIGOLF_USER_6", "1101"), "password": os.getenv("MIGOLF_PASS_6", "Golf123#")},
+    {"username": os.getenv("MIGOLF_USER_4", "1107"), "password": os.getenv("MIGOLF_PASS_4", "Golf123#")},
+    {"username": os.getenv("MIGOLF_USER_5", "2009"), "password": os.getenv("MIGOLF_PASS_5", "Golf123#")},
+    {"username": os.getenv("MIGOLF_USER_6", "2010"), "password": os.getenv("MIGOLF_PASS_6", "Golf123#")},
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -92,14 +96,42 @@ EVENT_LIST_URL = "https://macquarielinks.miclub.com.au/views/members/booking/eve
 HOME_URL       = "https://macquarielinks.miclub.com.au/views/members/home.xhtml"
 LOGOUT_URL     = "https://macquarielinks.miclub.com.au/security/logout.msp"
 
-LOGIN_TIME        = (17,  0)  # login at 5:00pm Sydney
+LOGIN_TIME        = (17, 15)  # login at 5:15pm Sydney (shifted from 17:00)
 QUEUE_JOIN_TIME   = (18, 30)  # ballot opens at 6:30pm — click event link here
 BOOKING_OPEN_TIME = (19,  0)  # tee sheet releases at 7:00pm
 HARD_TIMEOUT_TIME = (20,  0)  # give up at 8:00pm — no earlier
 
+LOGIN_STAGGER_SECS = 480      # 8 min between workers
+MAX_LOGIN_RETRIES  = 8        # up from 3
+LOGIN_BASE_BACKOFF = 30       # seconds (up from 10)
+LOGIN_MAX_BACKOFF  = 300      # 5-min cap
+
 OPEN_POLL_INTERVAL = 15  # seconds between event-list refreshes before draw (6 workers × 15s = low load)
 KEEPALIVE_INTERVAL = 300  # seconds between session keepalive navigations (5 min)
 BOOKING_MAX_ATTEMPTS = 999  # effectively unlimited — hard deadline is HARD_TIMEOUT_TIME
+
+# Anti-detection: diverse browser fingerprints
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+]
+
+WINDOW_SIZES = [
+    (1920, 1080),
+    (1366, 768),
+    (1440, 900),
+    (1536, 864),
+    (1280, 720),
+    (1600, 900),
+]
+
+# Discord notifications (bot token + channel)
+DISCORD_BOT_TOKEN  = os.getenv("DISCORD_BOT_TOKEN", "")
+DISCORD_CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID", "1481476007176306708")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING  (per-worker files)
@@ -170,6 +202,66 @@ def snap(driver: webdriver.Chrome, name: str, log: logging.Logger) -> None:
         log.info(f"Screenshot: {p.name}")
     except Exception as exc:
         log.warning(f"Screenshot failed ({name}): {exc}")
+
+
+def discord_notify(message: str, log: Optional[logging.Logger] = None) -> None:
+    """Post a message to the #golf-booking Discord channel via bot API."""
+    if not DISCORD_BOT_TOKEN or not DISCORD_CHANNEL_ID:
+        return
+    try:
+        data = json.dumps({"content": message}).encode("utf-8")
+        req = urllib.request.Request(
+            f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages",
+            data=data,
+            headers={
+                "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
+                "Content-Type": "application/json",
+                "User-Agent": "GolfBookingBot/1.0",
+            },
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as exc:
+        if log:
+            log.warning(f"Discord notify failed: {exc}")
+
+
+def discord_upload_screenshot(filepath: str, caption: str, log: Optional[logging.Logger] = None) -> None:
+    """Upload a screenshot to the #golf-booking Discord channel."""
+    if not DISCORD_BOT_TOKEN or not DISCORD_CHANNEL_ID:
+        return
+    try:
+        import io
+        p = Path(filepath)
+        if not p.exists() or p.stat().st_size == 0:
+            return
+        boundary = f"----GolfBot{random.randint(100000, 999999)}"
+        body = io.BytesIO()
+        # JSON payload part
+        body.write(f"--{boundary}\r\n".encode())
+        body.write(b'Content-Disposition: form-data; name="payload_json"\r\nContent-Type: application/json\r\n\r\n')
+        body.write(json.dumps({"content": caption}).encode())
+        body.write(b"\r\n")
+        # File part
+        body.write(f"--{boundary}\r\n".encode())
+        body.write(f'Content-Disposition: form-data; name="files[0]"; filename="{p.name}"\r\n'.encode())
+        body.write(b"Content-Type: image/png\r\n\r\n")
+        body.write(p.read_bytes())
+        body.write(f"\r\n--{boundary}--\r\n".encode())
+        req = urllib.request.Request(
+            f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages",
+            data=body.getvalue(),
+            headers={
+                "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "User-Agent": "GolfBookingBot/1.0",
+            },
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=30)
+    except Exception as exc:
+        if log:
+            log.warning(f"Discord screenshot upload failed: {exc}")
 
 
 def safe_accept_alert(driver: webdriver.Chrome) -> Tuple[bool, str]:
@@ -263,24 +355,46 @@ def compute_target() -> Tuple[str, str]:
 # ─────────────────────────────────────────────────────────────────────────────
 # SELENIUM SETUP
 # ─────────────────────────────────────────────────────────────────────────────
-def make_driver(log: Optional[logging.Logger] = None) -> webdriver.Chrome:
+def make_driver(log: Optional[logging.Logger] = None, worker_index: int = 0) -> webdriver.Chrome:
     opts = Options()
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--disable-extensions")
-    opts.add_argument("--window-size=1280,900")
+
+    # Per-worker fingerprint diversification
+    ua = USER_AGENTS[worker_index % len(USER_AGENTS)]
+    w, h = WINDOW_SIZES[worker_index % len(WINDOW_SIZES)]
+    opts.add_argument(f"--window-size={w},{h}")
+    opts.add_argument(f"--user-agent={ua}")
+
+    # Anti-automation detection flags
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+
     svc = Service()  # Selenium Manager auto-downloads matching chromedriver
     for attempt in range(1, 3):
         try:
             drv = webdriver.Chrome(options=opts, service=svc)
             drv.set_page_load_timeout(90)
-            # Log resolved browser and driver versions
+
+            # Override navigator.webdriver flag via CDP
+            drv.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+                "source": """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+Object.defineProperty(navigator, 'languages', {get: () => ['en-AU', 'en']});
+window.chrome = {runtime: {}};
+"""
+            })
+
             if log:
                 caps = drv.capabilities
                 log.info(f"Chrome version: {caps.get('browserVersion', 'unknown')}")
                 log.info(f"ChromeDriver version: {caps.get('chrome', {}).get('chromedriverVersion', 'unknown')}")
+                log.info(f"Worker fingerprint: UA={ua[:50]}... Window={w}x{h}")
             return drv
         except Exception as exc:
             if attempt == 2:
@@ -293,44 +407,86 @@ def make_driver(log: Optional[logging.Logger] = None) -> webdriver.Chrome:
 # ─────────────────────────────────────────────────────────────────────────────
 # AUTH
 # ─────────────────────────────────────────────────────────────────────────────
+def _human_type(element, text: str) -> None:
+    """Type text character-by-character with human-like delays."""
+    element.clear()
+    for ch in text:
+        element.send_keys(ch)
+        time.sleep(random.uniform(0.05, 0.15))
+
+
 def login(driver: webdriver.Chrome, username: str, password: str, log: logging.Logger) -> bool:
     log.info(f"Logging in...")
+    consecutive_fails = 0
 
-    # Retry loading the login page — MiClub may 403 on first attempt (IP rate limit)
-    for load_attempt in range(1, 4):
-        driver.get(LOGIN_URL)
-        time.sleep(2)
+    for attempt in range(1, MAX_LOGIN_RETRIES + 1):
+        # Circuit breaker: stop after 5 consecutive failures to protect IP
+        if consecutive_fails >= 5:
+            log.error("Circuit breaker: 5 consecutive login failures — aborting to protect IP")
+            discord_notify(f"🛑 Worker {username}: circuit breaker tripped after 5 login failures", log)
+            return False
+
+        # Load login page
+        try:
+            driver.get(LOGIN_URL)
+            time.sleep(random.uniform(1.5, 3.0))
+        except Exception as nav_exc:
+            err_str = str(nav_exc)
+            if "ERR_CONNECTION_REFUSED" in err_str or "net::ERR_" in err_str:
+                log.warning(f"Connection error (attempt {attempt}/{MAX_LOGIN_RETRIES}): {err_str[:100]}")
+                consecutive_fails += 1
+                backoff = min(LOGIN_BASE_BACKOFF * (2 ** (attempt - 1)), LOGIN_MAX_BACKOFF)
+                jitter = random.uniform(0, backoff * 0.3)
+                log.info(f"Backing off {backoff + jitter:.0f}s")
+                time.sleep(backoff + jitter)
+                continue
+            raise
+
+        # Check for 403 Forbidden
         try:
             page_text = driver.find_element(By.TAG_NAME, "body").text
         except Exception:
             page_text = ""
         if "Forbidden" in page_text or "403" in driver.title:
-            log.warning(f"Login page returned 403 Forbidden (attempt {load_attempt}/3) — retrying in {load_attempt * 10}s")
-            time.sleep(load_attempt * 10)
+            consecutive_fails += 1
+            backoff = min(LOGIN_BASE_BACKOFF * (2 ** (attempt - 1)), LOGIN_MAX_BACKOFF)
+            jitter = random.uniform(0, backoff * 0.3)
+            log.warning(f"403 Forbidden (attempt {attempt}/{MAX_LOGIN_RETRIES}) — backing off {backoff + jitter:.0f}s")
+            time.sleep(backoff + jitter)
             continue
-        break
 
-    try:
-        uf = WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.NAME, "user")))
-        uf.clear(); uf.send_keys(username)
-        pf = driver.find_element(By.NAME, "password")
-        pf.clear(); pf.send_keys(password)
-        driver.find_element(By.XPATH, "//input[@value='Login']").click()
-        WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.XPATH, "//a[contains(@href,'logout')]")))
-        log.info("Login successful")
-        snap(driver, f"login_ok_{username}", log)
-        return True
-    except Exception as exc:
-        log.error(f"Login failed: {exc}")
-        snap(driver, f"login_fail_{username}", log)
-        # Dump page source for post-mortem
+        # Attempt login with human-like typing
         try:
-            src_path = RUN_DIR / f"login_fail_{username}.html"
-            src_path.write_text(driver.page_source, encoding="utf-8")
-            log.info(f"Page source saved: {src_path.name}")
-        except Exception as src_exc:
-            log.warning(f"Could not save page source: {src_exc}")
-        return False
+            uf = WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.NAME, "user")))
+            _human_type(uf, username)
+            time.sleep(random.uniform(0.3, 0.8))  # pause between fields
+            pf = driver.find_element(By.NAME, "password")
+            _human_type(pf, password)
+            time.sleep(random.uniform(0.2, 0.5))  # pause before click
+            driver.find_element(By.XPATH, "//input[@value='Login']").click()
+            WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.XPATH, "//a[contains(@href,'logout')]")))
+            log.info("Login successful")
+            snap(driver, f"login_ok_{username}", log)
+            return True
+        except Exception as exc:
+            consecutive_fails += 1
+            log.warning(f"Login attempt {attempt}/{MAX_LOGIN_RETRIES} failed: {exc}")
+            snap(driver, f"login_fail_{username}_attempt{attempt}", log)
+            if attempt == MAX_LOGIN_RETRIES:
+                log.error(f"Login failed after {MAX_LOGIN_RETRIES} attempts")
+                try:
+                    src_path = RUN_DIR / f"login_fail_{username}.html"
+                    src_path.write_text(driver.page_source, encoding="utf-8")
+                    log.info(f"Page source saved: {src_path.name}")
+                except Exception as src_exc:
+                    log.warning(f"Could not save page source: {src_exc}")
+                return False
+            backoff = min(LOGIN_BASE_BACKOFF * (2 ** (attempt - 1)), LOGIN_MAX_BACKOFF)
+            jitter = random.uniform(0, backoff * 0.3)
+            log.info(f"Retrying in {backoff + jitter:.0f}s")
+            time.sleep(backoff + jitter)
+
+    return False
 
 
 def logout(driver: webdriver.Chrome, log: logging.Logger) -> None:
@@ -435,6 +591,7 @@ def navigate_and_wait_for_tee_sheet(
                     state = "draw" if in_draw else f"queue (pos {pos})"
                     log.info(f"Entered {state}.")
                     snap(driver, f"entered_{state.replace(' ', '_')}_{username}", log)
+                    discord_notify(f"⏳ Worker {username} entered {state}", log)
                     in_waiting_room = True
                     continue
 
@@ -517,6 +674,32 @@ def navigate_and_wait_for_tee_sheet(
 # ─────────────────────────────────────────────────────────────────────────────
 # NEW: SEARCH-BASED BOOKING  (makeBooking.xhtml flow)
 # ─────────────────────────────────────────────────────────────────────────────
+def _reveal_player_inputs(driver: webdriver.Chrome, log: Optional[logging.Logger] = None) -> None:
+    """
+    Reveal hidden autocomplete inputs on the makeBooking page.
+    MiClub hides the <span class="ui-autocomplete autocomplete"> wrapper
+    (display:none) until the user clicks the "Find Player" icon/text.
+    Native clicks are unreliable in headless mode, so we force display via JS.
+    """
+    try:
+        revealed = driver.execute_script("""
+            var spans = document.querySelectorAll('span.ui-autocomplete.autocomplete');
+            var count = 0;
+            for (var i = 0; i < spans.length; i++) {
+                if (window.getComputedStyle(spans[i]).display === 'none') {
+                    spans[i].style.display = 'inline-block';
+                    count++;
+                }
+            }
+            return count;
+        """)
+        if log:
+            log.info(f"_reveal_player_inputs: revealed {revealed} hidden autocomplete spans via JS")
+    except Exception as exc:
+        if log:
+            log.warning(f"_reveal_player_inputs failed: {exc}")
+
+
 def _find_empty_player_inputs(driver: webdriver.Chrome, log: Optional[logging.Logger] = None) -> list:
     """
     Return empty player search input fields on the makeBooking page.
@@ -524,26 +707,28 @@ def _find_empty_player_inputs(driver: webdriver.Chrome, log: Optional[logging.Lo
     Player 1 is always pre-filled (logged-in user), so we skip inputs with existing values.
     """
     try:
-        # Primary: PrimeFaces AutoComplete visible input (class-based — most reliable)
-        selectors = [
-            "//input[contains(@class,'ui-autocomplete-input') and not(@type='hidden')]",
-            # Fallback: placeholder-based (MiClub uses 'Type Name', not 'Find Player')
-            "//input[contains(@placeholder,'Type Name') or contains(@placeholder,'type name') "
-            "or contains(@placeholder,'Find Player') or contains(@placeholder,'find player')]",
-            "//input[@type='text' and (contains(@class,'inputfield') or contains(@class,'autocomplete'))]",
-            # Broad fallback: any visible text input that isn't the logged-in user's pre-filled field
-            "//input[@type='text' and not(@disabled) and not(@readonly)]",
+        # Primary: PrimeFaces AutoComplete input with 'Type Name' placeholder
+        inputs = driver.find_elements(
+            By.CSS_SELECTOR, "input.ui-autocomplete-input[placeholder='Type Name']"
+        )
+        empties = [i for i in inputs if not (i.get_attribute("value") or "").strip()]
+        if log:
+            log.info(f"_find_empty_player_inputs: {len(inputs)} Type Name inputs, {len(empties)} empty")
+        if empties:
+            return empties
+
+        # Fallback: any autocomplete input that isn't 'Select Club'
+        inputs = driver.find_elements(
+            By.CSS_SELECTOR, "input.ui-autocomplete-input"
+        )
+        empties = [
+            i for i in inputs
+            if not (i.get_attribute("value") or "").strip()
+            and (i.get_attribute("placeholder") or "").lower() not in ("select club", "")
         ]
-        for idx, sel in enumerate(selectors):
-            inputs = driver.find_elements(By.XPATH, sel)
-            visible = [i for i in inputs if i.is_displayed()]
-            empties = [i for i in visible if not (i.get_attribute("value") or "").strip()]
-            if log:
-                log.info(f"_find_empty_player_inputs: selector[{idx}] matched {len(visible)} visible, "
-                         f"{len(empties)} empty")
-            if empties:
-                return empties
-        return []
+        if log:
+            log.info(f"_find_empty_player_inputs fallback: {len(inputs)} autocomplete inputs, {len(empties)} empty")
+        return empties
     except Exception:
         return []
 
@@ -558,17 +743,11 @@ def _try_select_partners_checkboxes(
     required partners by member number or surname.  Returns number of players
     successfully ticked.
     """
-    # Build a lookup: member_number → surname
-    member_to_surname = {
-        "2007": "Mullin",  "2008": "Hillard",
-        "2009": "Rutherford", "2010": "Rudge",
-        "1101": "Lalor",   "1107": "Cheney",
-    }
-    target_names = {member_to_surname.get(p, p).lower() for p in partners_to_add}
+    target_names = {MEMBER_TO_SURNAME.get(p, p).lower() for p in partners_to_add}
     added = 0
     try:
         # Checkboxes are rendered as <input type='checkbox'> with adjacent <label> text,
-        # or wrapped in a <span>/<div> with the player name.
+        # or wrapped in PrimeFaces <div class="ui-chkbox"> with a clickable <div class="ui-chkbox-box">.
         checkboxes = driver.find_elements(
             By.XPATH,
             "//input[@type='checkbox']"
@@ -579,17 +758,12 @@ def _try_select_partners_checkboxes(
             try:
                 # Get label text — look at associated label, parent text, or sibling text
                 cb_id = cb.get_attribute("id") or ""
+                label_el = None
                 label_text = ""
                 if cb_id:
                     try:
-                        label = driver.find_element(By.XPATH, f"//label[@for='{cb_id}']")
-                        label_text = label.text.strip().lower()
-                    except Exception:
-                        pass
-                if not label_text:
-                    try:
-                        label_text = cb.find_element(By.XPATH, "./parent::*/text()").get_attribute("textContent") or ""
-                        label_text = label_text.strip().lower()
+                        label_el = driver.find_element(By.XPATH, f"//label[@for='{cb_id}']")
+                        label_text = label_el.text.strip().lower()
                     except Exception:
                         pass
                 if not label_text:
@@ -607,13 +781,43 @@ def _try_select_partners_checkboxes(
                 if any(name in label_text for name in target_names):
                     if not cb.is_selected():
                         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", cb)
+
+                        # PrimeFaces checkbox: click the wrapper div, not the raw input
+                        clicked = False
                         try:
-                            cb.click()
-                        except ElementClickInterceptedException:
-                            driver.execute_script("arguments[0].click();", cb)
-                        log.info(f"Ticked checkbox: {label_text}")
-                        added += 1
-                        time.sleep(0.3)
+                            pf_box = cb.find_element(
+                                By.XPATH,
+                                "./ancestor::div[contains(@class,'ui-chkbox')][1]"
+                                "//div[contains(@class,'ui-chkbox-box')]"
+                            )
+                            try:
+                                pf_box.click()
+                            except ElementClickInterceptedException:
+                                driver.execute_script("arguments[0].click();", pf_box)
+                            clicked = True
+                        except Exception:
+                            pass
+
+                        # Fallback: click the label element (fires associated input)
+                        if not clicked and label_el:
+                            try:
+                                label_el.click()
+                                clicked = True
+                            except Exception:
+                                pass
+
+                        # Final fallback: click raw input via JS
+                        if not clicked:
+                            try:
+                                driver.execute_script("arguments[0].click();", cb)
+                                clicked = True
+                            except Exception:
+                                pass
+
+                        if clicked:
+                            log.info(f"Ticked checkbox: {label_text}")
+                            added += 1
+                            time.sleep(0.3)
             except Exception as e:
                 log.debug(f"Checkbox check error: {e}")
     except Exception as exc:
@@ -641,56 +845,155 @@ def _try_select_partners_checkboxes(
     return added
 
 
+def _find_error_player_slots(driver: webdriver.Chrome, log: logging.Logger) -> list:
+    """
+    Detect player slots on makeBooking.xhtml that have 'already booked' errors.
+    Returns a list of (error_element, nearby_input_or_container) tuples.
+
+    Detection methods (in priority order):
+      1. Text nodes containing 'already booked' / 'already has a booking' / 'existing booking'
+      2. PrimeFaces message components: div.ui-message-error, span.ui-message-error-detail
+      3. PrimeFaces autocomplete wrappers with ui-state-error class
+    """
+    results = []
+    already_booked_phrases = [
+        "already booked", "already has a booking",
+        "existing booking", "already registered",
+        "member is already",
+    ]
+    try:
+        # Method 1: Text-based detection
+        error_elements = driver.find_elements(
+            By.XPATH,
+            "//*[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),"
+            "'already booked') or "
+            "contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),"
+            "'already has a booking') or "
+            "contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),"
+            "'existing booking') or "
+            "contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),"
+            "'member is already')]"
+        )
+        for el in error_elements:
+            if el.is_displayed():
+                results.append(el)
+
+        # Method 2: PrimeFaces error message components
+        pf_errors = driver.find_elements(
+            By.XPATH,
+            "//div[contains(@class,'ui-message-error')] | "
+            "//span[contains(@class,'ui-message-error-detail')] | "
+            "//div[contains(@class,'ui-messages-error')]"
+        )
+        for el in pf_errors:
+            if el.is_displayed() and any(p in el.text.lower() for p in already_booked_phrases):
+                if el not in results:
+                    results.append(el)
+
+        # Method 3: Autocomplete wrappers with error state
+        error_wrappers = driver.find_elements(
+            By.XPATH,
+            "//span[contains(@class,'ui-autocomplete') and contains(@class,'ui-state-error')]"
+        )
+        for el in error_wrappers:
+            if el.is_displayed() and el not in results:
+                results.append(el)
+
+    except Exception as exc:
+        log.debug(f"_find_error_player_slots error: {exc}")
+    return results
+
+
+def _remove_player_from_slot(driver: webdriver.Chrome, element, log: logging.Logger) -> bool:
+    """
+    Given an error element or player slot element, find and click the remove/close button.
+    Tries multiple strategies for PrimeFaces autocomplete widgets.
+    Returns True if removal was successful.
+    """
+    # Walk up through ancestors looking for a remove/close control
+    ancestor_xpaths = [
+        "./ancestor::span[contains(@class,'ui-autocomplete')][1]",
+        "./ancestor::td[1]",
+        "./ancestor::tr[1]",
+        "./ancestor::div[contains(@class,'player') or contains(@class,'slot') or contains(@class,'booking')][1]",
+        "./ancestor::div[1]",
+    ]
+
+    remove_selectors = [
+        # PrimeFaces autocomplete close icon
+        ".//span[contains(@class,'ui-icon-close')]/..",
+        ".//span[contains(@class,'ui-autocomplete-close')]",
+        # Generic remove buttons
+        ".//a[contains(@class,'remove') or contains(@onclick,'remove') or @title='Remove']",
+        ".//button[contains(@class,'remove') or contains(@class,'delete')]",
+        ".//a[contains(@class,'close') or @title='Close']",
+        # Icon-based close (PrimeFaces)
+        ".//span[contains(@class,'ui-icon-close')]",
+    ]
+
+    for anc_xpath in ancestor_xpaths:
+        try:
+            container = element.find_element(By.XPATH, anc_xpath)
+        except Exception:
+            continue
+
+        for sel in remove_selectors:
+            try:
+                btns = container.find_elements(By.XPATH, sel)
+                for btn in btns:
+                    if btn.is_displayed():
+                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+                        try:
+                            btn.click()
+                        except ElementClickInterceptedException:
+                            driver.execute_script("arguments[0].click();", btn)
+                        log.info("Removed player via close/remove button")
+                        time.sleep(0.5)
+                        return True
+            except Exception:
+                continue
+
+    # Nuclear fallback: find the nearest autocomplete input and clear it via JS
+    try:
+        for anc_xpath in ancestor_xpaths[:3]:
+            try:
+                container = element.find_element(By.XPATH, anc_xpath)
+                inputs = container.find_elements(By.XPATH, ".//input[contains(@class,'ui-autocomplete-input')]")
+                for inp in inputs:
+                    if inp.is_displayed() and (inp.get_attribute("value") or "").strip():
+                        driver.execute_script(
+                            "arguments[0].value = ''; "
+                            "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));",
+                            inp
+                        )
+                        log.info("Cleared player slot via JS value reset")
+                        time.sleep(0.5)
+                        return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return False
+
+
 def _clear_already_booked_slots(driver: webdriver.Chrome, log: logging.Logger) -> int:
     """
-    On makeBooking.xhtml, detect player slots showing 'Member is already booked'
-    (inline error after Book Group → Yes pre-fills group) and remove them.
-    Returns number of slots cleared.
+    On makeBooking.xhtml, detect player slots showing 'already booked' errors
+    and remove them. Returns number of slots cleared.
     """
+    error_elements = _find_error_player_slots(driver, log)
+    if not error_elements:
+        return 0
+
     cleared = 0
-    try:
-        # Look for the warning/error text pattern "Member is already booked"
-        # These appear as text nodes or spans near the player input rows
-        error_rows = driver.find_elements(
-            By.XPATH,
-            "//*[contains(text(),'already booked') or contains(text(),'Member is already')]"
-        )
-        for err in error_rows:
-            if not err.is_displayed():
-                continue
-            log.info(f"Found already-booked error: '{err.text.strip()}'")
-            # Try to find and click the remove/X button in the same row
-            try:
-                # Walk up to the row container and find a remove button
-                for ancestor_xpath in ["./ancestor::tr[1]", "./ancestor::td[1]", "./ancestor::div[1]"]:
-                    try:
-                        container = err.find_element(By.XPATH, ancestor_xpath)
-                        # Look for remove buttons: span with X, link with 'remove', button with X icon
-                        remove_btns = container.find_elements(
-                            By.XPATH,
-                            ".//a[contains(@class,'remove') or contains(@onclick,'remove') or "
-                            "contains(@class,'delete') or @title='Remove'] | "
-                            ".//button[contains(@class,'remove') or contains(@class,'delete')] | "
-                            ".//span[contains(@class,'ui-icon-close') or contains(@class,'remove-player')]/.."
-                        )
-                        if remove_btns:
-                            driver.execute_script(
-                                "arguments[0].scrollIntoView({block:'center'});", remove_btns[0]
-                            )
-                            try:
-                                remove_btns[0].click()
-                            except ElementClickInterceptedException:
-                                driver.execute_script("arguments[0].click();", remove_btns[0])
-                            log.info("Cleared already-booked slot via remove button")
-                            cleared += 1
-                            time.sleep(0.5)
-                            break
-                    except Exception:
-                        continue
-            except Exception as e:
-                log.debug(f"Could not remove already-booked slot: {e}")
-    except Exception as exc:
-        log.debug(f"_clear_already_booked_slots error: {exc}")
+    for err in error_elements:
+        log.info(f"Found already-booked error: '{err.text.strip()[:80]}'")
+        if _remove_player_from_slot(driver, err, log):
+            cleared += 1
+        else:
+            log.warning("Could not remove already-booked player — slot may still be occupied")
+
     return cleared
 
 
@@ -699,21 +1002,29 @@ def _search_and_select_player(
     input_el,
     member_number: str,
     log: logging.Logger,
-) -> bool:
-    """Type member number into a Find Player field, wait for autocomplete, click result."""
+) -> str:
+    """
+    Type member number into a Find Player field, wait for autocomplete, click result.
+
+    Returns:
+      "ok"             — player added successfully
+      "already_booked" — player found but already has a booking (slot auto-cleared)
+      "not_found"      — no autocomplete result appeared
+      "error"          — unexpected failure
+    """
+    surname = MEMBER_TO_SURNAME.get(member_number, member_number)
     try:
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", input_el)
-        input_el.click()
+        driver.execute_script("arguments[0].click();", input_el)
         time.sleep(0.3)
         input_el.clear()
         input_el.send_keys(member_number)
-        log.info(f"Searching for player {member_number}...")
+        log.info(f"Searching for player {member_number} ({surname})...")
 
         # Wait for autocomplete dropdown
         deadline = time.time() + 10
         result = None
         while time.time() < deadline:
-            # Common autocomplete patterns for JSF/PrimeFaces
             candidates = driver.find_elements(
                 By.XPATH,
                 "//*[contains(@class,'ui-autocomplete-item') or "
@@ -729,28 +1040,101 @@ def _search_and_select_player(
             time.sleep(0.2)
 
         if result is None:
-            # Fallback: try pressing Enter (some sites accept member number directly)
             log.warning(f"No autocomplete for {member_number}, trying Enter key")
             input_el.send_keys(Keys.RETURN)
             time.sleep(0.5)
-            # Check if the field now has a name (accepted)
             val = input_el.get_attribute("value") or ""
             if val and not val.isdigit():
                 log.info(f"Player accepted via Enter: {val}")
-                return True
-            return False
+            else:
+                return "not_found"
+        else:
+            log.info(f"Selecting: {result.text.strip()}")
+            try:
+                result.click()
+            except ElementClickInterceptedException:
+                driver.execute_script("arguments[0].click();", result)
 
-        log.info(f"Selecting: {result.text.strip()}")
+        # Post-selection: wait briefly then check for "already booked" errors
+        time.sleep(1.0)
+
+        already_booked_phrases = [
+            "already booked", "already has a booking",
+            "existing booking", "already registered",
+            "member is already",
+        ]
+
+        # Check page body and nearby error messages
         try:
-            result.click()
-        except ElementClickInterceptedException:
-            driver.execute_script("arguments[0].click();", result)
-        time.sleep(0.4)
-        return True
+            body = driver.find_element(By.TAG_NAME, "body").text.lower()
+        except Exception:
+            body = ""
+
+        is_error = any(p in body for p in already_booked_phrases)
+
+        # Also check PrimeFaces inline error messages
+        if not is_error:
+            try:
+                pf_msgs = driver.find_elements(
+                    By.XPATH,
+                    "//div[contains(@class,'ui-message-error')] | "
+                    "//span[contains(@class,'ui-message-error-detail')] | "
+                    "//div[contains(@class,'ui-messages-error')]"
+                )
+                for msg in pf_msgs:
+                    if msg.is_displayed() and any(p in msg.text.lower() for p in already_booked_phrases):
+                        is_error = True
+                        break
+            except Exception:
+                pass
+
+        if is_error:
+            log.warning(f"Player {member_number} ({surname}) is already booked — clearing slot")
+            snap(driver, f"already_booked_{member_number}", log)
+
+            # Try to clear this player from the slot
+            # Find the input that now contains the player's name (surname)
+            try:
+                filled_inputs = driver.find_elements(
+                    By.XPATH,
+                    f"//input[contains(@class,'ui-autocomplete-input') and "
+                    f"contains(translate(@value,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),"
+                    f"'{surname.lower()}')]"
+                )
+                for inp in filled_inputs:
+                    if inp.is_displayed():
+                        _remove_player_from_slot(driver, inp, log)
+                        break
+            except Exception as rm_exc:
+                log.debug(f"Could not clear already-booked slot for {surname}: {rm_exc}")
+
+            return "already_booked"
+
+        # Verify the input actually has a value now
+        try:
+            val = input_el.get_attribute("value") or ""
+            if val and not val.isdigit():
+                log.info(f"Player {member_number} ({surname}) added: {val}")
+                return "ok"
+            # Input might have moved — check if any input now contains the surname
+            filled = driver.find_elements(
+                By.XPATH,
+                f"//input[contains(@class,'ui-autocomplete-input') and "
+                f"contains(translate(@value,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),"
+                f"'{surname.lower()}')]"
+            )
+            if filled:
+                log.info(f"Player {member_number} ({surname}) confirmed in slot")
+                return "ok"
+        except Exception:
+            pass
+
+        log.info(f"Player {member_number} selection status unclear — assuming ok")
+        return "ok"
 
     except Exception as exc:
         log.error(f"Search/select failed for {member_number}: {exc}")
-        return False
+        return "error"
 
 
 def _get_row_id(row) -> str:
@@ -811,6 +1195,7 @@ def execute_search_booking(
     log: logging.Logger,
     max_attempts: int = BOOKING_MAX_ATTEMPTS,
     skip_row_ids: Optional[set] = None,
+    cancel_event: Optional[multiprocessing.Event] = None,
 ) -> Tuple[bool, str]:
     """
     Find a slot with enough empty spaces, click Book Group, click No on the modal,
@@ -818,16 +1203,30 @@ def execute_search_booking(
 
     partners_to_add: member numbers of players to add (not including logged-in user)
     required_slots:  total players needed (4 for 4-ball, 2 for 2-ball)
+    cancel_event:    if set by another worker, abort early
     """
     log.info(f"Starting search-based booking for {required_slots}-ball. Partners: {partners_to_add}")
     deadline = hard_deadline_sydney()
 
+    locked_row_ids: set = set()          # rows locked by other users (cleared periodically)
+    locked_clear_time = time.time() + 30  # clear locked set every 30s
+
     attempt = 0
     while attempt < max_attempts and time.time() < deadline:
+        if cancel_event and cancel_event.is_set():
+            log.info("Another worker already completed this booking — aborting.")
+            return False, ""
         attempt += 1
         row_id = ""
         mins_remaining = max(0, (deadline - time.time()) / 60)
         log.info(f"Booking attempt {attempt} ({mins_remaining:.0f} min until 8pm timeout)...")
+
+        # Periodically clear locked-row memory so we retry released rows
+        if time.time() > locked_clear_time:
+            if locked_row_ids:
+                log.info(f"Clearing {len(locked_row_ids)} locked-row entries (30s cooldown)")
+            locked_row_ids.clear()
+            locked_clear_time = time.time() + 30
 
         try:
             # ── 1. Find a suitable row ─────────────────────────────────────
@@ -849,6 +1248,9 @@ def execute_search_booking(
                         log.info(
                             f"Skipping row_id={candidate_row_id} (already booked by another group) — trying next row"
                         )
+                        continue
+                    if candidate_row_id and candidate_row_id in locked_row_ids:
+                        log.info(f"Skipping row_id={candidate_row_id} (locked by another user) — trying next row")
                         continue
                     target_row = row
                     row_id = candidate_row_id
@@ -882,7 +1284,9 @@ def execute_search_booking(
             # Check for alert (slot locked by someone else)
             alerted, alert_text = safe_accept_alert(driver)
             if alerted:
-                log.info(f"Slot locked (alert: {alert_text}) — trying next slot")
+                if row_id:
+                    locked_row_ids.add(row_id)
+                log.info(f"Slot locked (alert: {alert_text}) — skipping row_id={row_id}, trying next slot")
                 driver.refresh()
                 time.sleep(2)
                 continue
@@ -946,7 +1350,11 @@ def execute_search_booking(
             # ── 5. Add partners ────────────────────────────────────────────
             # Strategy A: click the pre-configured "Select Partners" checkboxes
             # Strategy B: type member number into PrimeFaces autocomplete fields
-            # Strategy A is faster and more reliable when pre-configured groups match.
+            # If a partner is already booked, remove them and try alternates.
+
+            # Reveal hidden autocomplete inputs by clicking "Find Player" icons
+            _reveal_player_inputs(driver, log)
+            time.sleep(0.5)
 
             ticked = _try_select_partners_checkboxes(driver, partners_to_add, log)
             log.info(f"Checkbox strategy: ticked {ticked}/{len(partners_to_add)} partners")
@@ -967,55 +1375,59 @@ def execute_search_booking(
             except Exception:
                 pass
 
-            # Strategy B: autocomplete search for any partners not yet added
+            # Strategy B: autocomplete search — build a queue of partners to try.
+            # Primary partners first, then alternates (other group members not in this booking).
             remaining_partners = partners_to_add[ticked:] if ticked < len(partners_to_add) else []
-            partners_added_by_search = 0
 
-            # If a member is already in the tee sheet / already booked,
-            # skip them and fill the slot with the next available partner.
+            # Build alternate partner pool: all known members except the logged-in user
+            # and those already in the primary partner list
+            primary_set = set(partners_to_add) | {username}
+            alternate_partners = [m for m in MEMBER_TO_SURNAME.keys()
+                                  if m not in primary_set]
+            partner_queue = list(remaining_partners) + alternate_partners
+
+            partners_added_by_search = 0
+            attempted: set = set()
             skipped: List[str] = []
-            for member_num in remaining_partners:
+
+            for member_num in partner_queue:
+                if member_num in attempted:
+                    continue
+                attempted.add(member_num)
+
                 empty_inputs = _find_empty_player_inputs(driver, log)
                 if not empty_inputs:
                     log.info("No more empty Find Player slots — all filled.")
                     break
-                ok = _search_and_select_player(driver, empty_inputs[0], member_num, log)
-                if not ok:
-                    log.warning(f"Could not add {member_num} (may already be booked) — skipping")
+
+                # We've added enough partners already
+                needed = len(partners_to_add) - ticked - partners_added_by_search
+                if needed <= 0:
+                    break
+
+                result = _search_and_select_player(driver, empty_inputs[0], member_num, log)
+
+                if result == "ok":
+                    partners_added_by_search += 1
+                    time.sleep(0.3)
+                elif result == "already_booked":
+                    log.warning(f"Player {member_num} already booked — trying next in queue")
+                    skipped.append(member_num)
+                    # _search_and_select_player already attempted slot cleanup;
+                    # double-check and clear any lingering errors
+                    _clear_already_booked_slots(driver, log)
+                    continue
+                elif result == "not_found":
+                    log.warning(f"Player {member_num} not found in autocomplete — skipping")
                     skipped.append(member_num)
                     continue
-                partners_added_by_search += 1
-                time.sleep(0.5)
-
-                # Check for "already booked" error message after adding
-                try:
-                    body = driver.find_element(By.TAG_NAME, "body").text
-                    already_booked_phrases = [
-                        "already booked", "already has a booking",
-                        "existing booking", "already registered",
-                    ]
-                    if any(p in body.lower() for p in already_booked_phrases):
-                        log.warning(f"Player {member_num} already has a booking — removing and skipping")
-                        partners_added_by_search -= 1
-                        # Try to remove them (click the red X next to their name)
-                        try:
-                            remove_btns = driver.find_elements(
-                                By.XPATH,
-                                f"//input[contains(@value,'{member_num}') or "
-                                f"contains(following-sibling::*,'{member_num}')]"
-                                "/ancestor::*[1]//a[contains(@class,'remove') or contains(@class,'delete') or @title='Remove']"
-                            )
-                            if remove_btns:
-                                remove_btns[0].click()
-                                time.sleep(0.5)
-                        except Exception:
-                            pass
-                        skipped.append(member_num)
-                except Exception:
-                    pass
+                else:  # "error"
+                    log.warning(f"Error adding {member_num} — skipping")
+                    skipped.append(member_num)
+                    continue
 
             if skipped:
-                log.info(f"Skipped already-booked members: {skipped}. Proceeding with remaining players.")
+                log.info(f"Skipped members: {skipped}. Proceeding with {partners_added_by_search} added by search.")
 
             # Safety check: use explicit count of partners added, not empty-input inference
             total_partners_added = ticked + partners_added_by_search
@@ -1146,6 +1558,7 @@ def execute_bookgroup_yes_fallback(
     required_slots: int,
     log: logging.Logger,
     skip_row_ids: Optional[set] = None,
+    cancel_event: Optional[multiprocessing.Event] = None,
 ) -> bool:
     """
     Fallback booking method: click BOOK GROUP → Yes (uses MiClub pre-configured group).
@@ -1161,10 +1574,20 @@ def execute_bookgroup_yes_fallback(
     log.info("▶ FALLBACK: Book Group → Yes method")
     deadline = hard_deadline_sydney()
     attempt  = 0
+    locked_row_ids: set = set()
+    locked_clear_time = time.time() + 30
 
     while attempt < BOOKING_MAX_ATTEMPTS and time.time() < deadline:
+        if cancel_event and cancel_event.is_set():
+            log.info("Another worker already completed this booking — aborting fallback.")
+            return False
         attempt += 1
         log.info(f"Fallback attempt {attempt}...")
+
+        # Clear locked rows periodically
+        if time.time() > locked_clear_time:
+            locked_row_ids.clear()
+            locked_clear_time = time.time() + 30
 
         try:
             if not _wait_for_tee_table(driver, log, timeout=60):
@@ -1182,6 +1605,9 @@ def execute_bookgroup_yes_fallback(
                         candidate_id = _get_row_id(row)
                         if skip_row_ids and candidate_id and candidate_id in skip_row_ids:
                             log.info(f"Fallback: skipping row_id={candidate_id} (used by another group)")
+                            continue
+                        if candidate_id and candidate_id in locked_row_ids:
+                            log.info(f"Fallback: skipping row_id={candidate_id} (locked by another user)")
                             continue
                         target_row = row
                         break
@@ -1213,7 +1639,10 @@ def execute_bookgroup_yes_fallback(
             # Dismiss any unexpected alert (slot taken)
             alerted, alert_text = safe_accept_alert(driver)
             if alerted:
-                log.warning(f"Fallback: slot alert ({alert_text}) — retrying")
+                fallback_rid = _get_row_id(target_row) if target_row else ""
+                if fallback_rid:
+                    locked_row_ids.add(fallback_rid)
+                log.warning(f"Fallback: slot alert ({alert_text}) — skipping row_id={fallback_rid}, retrying")
                 driver.refresh()
                 time.sleep(2)
                 continue
@@ -1272,39 +1701,15 @@ def execute_bookgroup_yes_fallback(
                             time.sleep(2)
                             continue
 
-                    # On makeBooking page — find player fields with errors and remove them
+                    # On makeBooking page — find and remove error player slots
                     try:
                         WebDriverWait(driver, 10).until(lambda d: "makeBooking" in d.current_url)
                         time.sleep(1)
                         snap(driver, f"fallback{attempt}_makebooking_remove", log)
-                        # Remove any player showing an error (red background / error class)
-                        # Common patterns: the field has an error style or the row has an error indicator
-                        error_fields = driver.find_elements(
-                            By.XPATH,
-                            "//*[contains(@class,'error') or contains(@class,'invalid') or "
-                            "contains(@class,'ui-state-error')]//input | "
-                            "//input[contains(@class,'error') or contains(@class,'invalid')]"
-                        )
-                        for ef in error_fields:
-                            if ef.is_displayed():
-                                # Find the remove/X button nearby
-                                try:
-                                    parent = ef.find_element(By.XPATH, "./ancestor::td[1] | ./ancestor::div[1]")
-                                    remove = parent.find_element(
-                                        By.XPATH,
-                                        ".//a[contains(@class,'remove') or contains(@onclick,'remove') or "
-                                        "@title='Remove'] | .//button[contains(@class,'remove')]"
-                                    )
-                                    remove.click()
-                                    log.info("Fallback: removed already-booked player from slot")
-                                    time.sleep(0.5)
-                                except Exception:
-                                    # Try clearing the field
-                                    try:
-                                        ef.clear()
-                                        ef.send_keys(Keys.DELETE)
-                                    except Exception:
-                                        pass
+
+                        # Use shared error detection and removal helpers
+                        cleared = _clear_already_booked_slots(driver, log)
+                        log.info(f"Fallback: cleared {cleared} already-booked slot(s)")
 
                         snap(driver, f"fallback{attempt}_after_remove", log)
                         # Confirm with remaining players
@@ -1423,20 +1828,30 @@ def worker(
     twoball_booked: multiprocessing.Event,
     fourball_winner_val: multiprocessing.Value,
     fourball_row_id_val: multiprocessing.Value,
+    worker_index: int = 0,
+    login_delay: float = 0.0,
 ) -> None:
     log = make_worker_logger(username)
-    log.info(f"Worker started. Target: {target_day} {target_date}")
+    log.info(f"Worker started (index={worker_index}, delay={login_delay:.0f}s). Target: {target_day} {target_date}")
 
     driver = None
     try:
-        driver = make_driver(log=log)
+        driver = make_driver(log=log, worker_index=worker_index)
 
-        # Wait until 6:00pm Sydney before logging in
+        # Wait until login time then apply per-worker stagger
         wait_until_sydney(LOGIN_TIME[0], LOGIN_TIME[1], "Login gate", log)
+        if login_delay > 0:
+            jitter = random.uniform(0, 30)
+            total_delay = login_delay + jitter
+            log.info(f"Stagger delay: {login_delay:.0f}s + {jitter:.0f}s jitter = {total_delay:.0f}s")
+            time.sleep(total_delay)
 
         if not login(driver, username, password, log):
             log.error("Login failed — exiting worker")
+            discord_notify(f"❌ Worker {username}: login failed after {MAX_LOGIN_RETRIES} attempts", log)
             return
+
+        discord_notify(f"🔑 Worker {username} logged in", log)
 
         if not navigate_and_wait_for_tee_sheet(driver, target_day, target_date, log, username, password):
             log.error("Could not reach tee sheet — exiting worker")
@@ -1446,11 +1861,13 @@ def worker(
         if not fourball_booked.is_set():
             partners_4 = get_fourball_partners(username)
             log.info(f"Attempting 4-ball (search method). Adding: {partners_4}")
-            success, row_id = execute_search_booking(driver, username, partners_4, 4, log)
+            success, row_id = execute_search_booking(driver, username, partners_4, 4, log,
+                                                      cancel_event=fourball_booked)
 
             if not success and not fourball_booked.is_set():
                 log.warning("Search booking failed — trying Book Group → Yes fallback")
-                success = execute_bookgroup_yes_fallback(driver, username, 4, log)
+                success = execute_bookgroup_yes_fallback(driver, username, 4, log,
+                                                          cancel_event=fourball_booked)
 
             if success and not fourball_booked.is_set():
                 fourball_booked.set()
@@ -1463,19 +1880,32 @@ def worker(
                 except Exception:
                     pass
                 log.info(f"🏆 4-ball booked by {username}!")
+                fourball_partners = get_fourball_partners(username)
+                all_fourball = [username] + fourball_partners
+                names = [MEMBER_TO_SURNAME.get(m, m) for m in all_fourball]
+                caption = f"✅ 4-ball BOOKED by {MEMBER_TO_SURNAME.get(username, username)}!\nPlayers: {', '.join(names)}"
+                discord_notify(caption, log)
+                # Upload tee sheet screenshot showing the booking
+                ss_path = RUN_DIR / f"fourball_confirmed_{username}.png"
+                try:
+                    driver.save_screenshot(str(ss_path))
+                    discord_upload_screenshot(str(ss_path), "4-ball booking confirmed — tee sheet:", log)
+                except Exception as exc:
+                    log.warning(f"Failed to capture/upload 4-ball screenshot: {exc}")
+                # Only the winning worker logs out — others stay on tee sheet
+                # in case they're ahead in queue for other bookings
                 logout(driver, log)
                 return
             log.info("4-ball attempt complete (may have been taken by another worker)")
         else:
             log.info("4-ball already booked by another worker.")
 
-        # 4-ball members have no role in the 2-ball — exit cleanly
-        if username in FOUR_BALL_MEMBERS:
-            log.info(f"{username} is a 4-ball member — nothing more to do.")
+        # ── Attempt 2-ball (ANY worker who is through can attempt this) ────
+        if twoball_booked.is_set():
+            log.info("2-ball already booked — nothing left to do.")
             logout(driver, log)
             return
 
-        # ── Attempt 2-ball (only 2-ball group members reach here) ─────────
         if not twoball_booked.is_set():
             try:
                 winner = fourball_winner_val.value.decode().rstrip('\x00')
@@ -1503,20 +1933,31 @@ def worker(
                 2,
                 log,
                 skip_row_ids=skip_ids,
+                cancel_event=twoball_booked,
             )
 
             if not success and not twoball_booked.is_set():
                 log.warning("Search booking failed for 2-ball — trying Book Group → Yes fallback")
-                success = execute_bookgroup_yes_fallback(driver, username, 2, log, skip_row_ids=skip_ids)
+                success = execute_bookgroup_yes_fallback(driver, username, 2, log,
+                                                          skip_row_ids=skip_ids,
+                                                          cancel_event=twoball_booked)
 
             if success and not twoball_booked.is_set():
                 twoball_booked.set()
                 log.info(f"🏆 2-ball booked by {username}!")
+                twoball_names = [MEMBER_TO_SURNAME.get(username, username)] + [MEMBER_TO_SURNAME.get(p, p) for p in partners_2]
+                caption = f"✅ 2-ball BOOKED by {MEMBER_TO_SURNAME.get(username, username)}!\nPlayers: {', '.join(twoball_names)}"
+                discord_notify(caption, log)
+                # Upload tee sheet screenshot showing the booking
+                ss_path = RUN_DIR / f"twoball_confirmed_{username}.png"
+                try:
+                    driver.save_screenshot(str(ss_path))
+                    discord_upload_screenshot(str(ss_path), "2-ball booking confirmed — tee sheet:", log)
+                except Exception as exc:
+                    log.warning(f"Failed to capture/upload 2-ball screenshot: {exc}")
                 logout(driver, log)
                 return
             log.info("2-ball attempt complete — both bookings likely handled by other workers")
-        else:
-            log.info("2-ball already booked — nothing left to do")
 
         logout(driver, log)
 
@@ -1524,6 +1965,10 @@ def worker(
         log.exception(f"Worker crashed: {exc}")
     finally:
         if driver:
+            try:
+                logout(driver, log)
+            except Exception:
+                pass
             try:
                 driver.quit()
             except Exception:
@@ -1663,81 +2108,6 @@ def verify_bookings(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EMAIL NOTIFICATION
-# ─────────────────────────────────────────────────────────────────────────────
-
-def send_confirmation_email(
-    target_date: str,
-    result: dict,
-    fourball_ok: bool,
-    twoball_ok: bool,
-    log: logging.Logger,
-) -> None:
-    """Send a booking confirmation (or failure alert) to NOTIFICATION_EMAIL via Gmail SMTP."""
-    if not GMAIL_USER or not GMAIL_APP_PASSWORD:
-        log.warning("Email: GMAIL_USER or GMAIL_APP_PASSWORD not set — skipping email")
-        return
-
-    all_confirmed = len(result.get("missing", [])) == 0
-    subject = (
-        f"⛳ Golf Booking {'Confirmed' if all_confirmed else 'PARTIAL/FAILED'} — {target_date}"
-    )
-
-    lines = [
-        f"Golf booking run complete for {target_date}.",
-        "",
-        f"4-ball booked: {'✅ Yes' if fourball_ok else '❌ No'}",
-        f"2-ball booked: {'✅ Yes' if twoball_ok else '❌ No'}",
-        "",
-        "── Tee Sheet Verification ──",
-    ]
-    if result.get("confirmed"):
-        lines.append(f"Confirmed on sheet: {', '.join(result['confirmed'])}")
-    if result.get("missing"):
-        lines.append(f"⚠️  NOT found on sheet: {', '.join(result['missing'])}")
-    else:
-        lines.append("All 6 players confirmed on the tee sheet ✅")
-
-    if result.get("tee_times"):
-        lines += ["", "── Your tee times ──"]
-        lines += [f"  {t}" for t in result["tee_times"]
-                  if any(s.lower() in t.lower() for s in ALL_PLAYER_SURNAMES)]
-
-    body = "\n".join(lines)
-    log.info(f"Email body:\n{body}")
-
-    try:
-        msg = MIMEMultipart()
-        msg["From"]    = GMAIL_USER
-        msg["To"]      = NOTIFICATION_EMAIL
-        msg["Subject"] = subject
-        msg.attach(MIMEText(body, "plain"))
-
-        # Attach tee sheet screenshots
-        screenshots = result.get("screenshots", [])
-        for ss_path in screenshots:
-            try:
-                p = Path(ss_path)
-                if p.exists() and p.stat().st_size > 0:
-                    with open(p, "rb") as f:
-                        img = MIMEImage(f.read(), name=p.name)
-                    img.add_header("Content-Disposition", "attachment", filename=p.name)
-                    msg.attach(img)
-                    log.info(f"Attached screenshot: {p.name}")
-            except Exception as att_exc:
-                log.warning(f"Could not attach {ss_path}: {att_exc}")
-
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-            server.sendmail(GMAIL_USER, NOTIFICATION_EMAIL, msg.as_string())
-
-        log.info(f"✉️  Confirmation email sent to {NOTIFICATION_EMAIL} "
-                 f"({len(screenshots)} screenshot(s) attached)")
-    except Exception as exc:
-        log.error(f"Email failed: {exc}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:
@@ -1750,7 +2120,10 @@ def main() -> None:
     log.info(f"4-ball group: {FOUR_BALL_MEMBERS}")
     log.info(f"2-ball group: {TWO_BALL_MEMBERS}")
     log.info(f"Workers: {[u['username'] for u in ALL_USERS]}")
+    log.info(f"Login stagger: {LOGIN_STAGGER_SECS}s between workers")
     log.info(f"Logs: {RUN_DIR}")
+
+    discord_notify(f"🏌️ Booking run started — targeting {target_day} {target_date}", log)
 
     manager: SyncManager
     with multiprocessing.Manager() as manager:
@@ -1760,7 +2133,8 @@ def main() -> None:
         fourball_row_id_val = manager.Value(bytes, b"")
 
         processes = []
-        for user in ALL_USERS:
+        for idx, user in enumerate(ALL_USERS):
+            delay = idx * LOGIN_STAGGER_SECS  # 0s, 8m, 16m, 24m, 32m, 40m
             p = multiprocessing.Process(
                 target=worker,
                 args=(
@@ -1772,13 +2146,14 @@ def main() -> None:
                     twoball_booked,
                     fourball_winner_val,
                     fourball_row_id_val,
+                    idx,
+                    float(delay),
                 ),
                 name=f"worker-{user['username']}",
             )
             p.start()
-            log.info(f"Started worker for {user['username']} (pid {p.pid})")
+            log.info(f"Started worker for {user['username']} (pid {p.pid}, delay={delay}s)")
             processes.append(p)
-            time.sleep(3)  # stagger starts to avoid 403 rate-limiting
 
         # Wait for both bookings to complete, or all workers to finish — hard stop at 8pm
         deadline = hard_deadline_sydney()
@@ -1796,7 +2171,17 @@ def main() -> None:
         fourball_ok = fourball_booked.is_set()
         twoball_ok  = twoball_booked.is_set()
 
-        # Clean shutdown
+        # Give workers time to detect events and log out cleanly
+        alive = [p for p in processes if p.is_alive()]
+        if alive and fourball_booked.is_set() and twoball_booked.is_set():
+            log.info(f"Waiting up to 30s for {len(alive)} remaining workers to log out...")
+            for _ in range(15):
+                alive = [p for p in processes if p.is_alive()]
+                if not alive:
+                    break
+                time.sleep(2)
+
+        # Force-terminate any workers that didn't exit cleanly
         for p in processes:
             if p.is_alive():
                 log.info(f"Terminating {p.name}")
@@ -1818,8 +2203,21 @@ def main() -> None:
     else:
         log.warning("No bookings confirmed — skipping verification")
 
-    # Email
-    send_confirmation_email(target_date, verify_result, fourball_ok, twoball_ok, log)
+    # Discord final summary
+    four_emoji = "✅" if fourball_ok else "❌"
+    two_emoji = "✅" if twoball_ok else "❌"
+    confirmed = verify_result.get("confirmed", [])
+    missing = verify_result.get("missing", [])
+    summary = f"📊 Final: 4-ball {four_emoji} | 2-ball {two_emoji}"
+    if confirmed:
+        summary += f" | Verified: {', '.join(confirmed)}"
+    if missing:
+        summary += f" | Missing: {', '.join(missing)}"
+    discord_notify(summary, log)
+
+    # Upload key screenshots to Discord
+    for ss_path in verify_result.get("screenshots", [])[:3]:
+        discord_upload_screenshot(ss_path, "📸 Tee sheet verification", log)
 
     # Zip logs
     zip_path = RUN_ROOT / f"{RUN_ID}.zip"

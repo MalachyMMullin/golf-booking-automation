@@ -1,11 +1,8 @@
 name: Thursday golf booking - Parallel (all 6 users)
 
 on:
-  schedule:
-    # 06:00 UTC Thursday = 17:00 AEDT (UTC+11, Oct–Apr) / 16:00 AEST (UTC+10, Apr–Oct)
-    # The script waits internally until 17:00 Sydney time before logging in,
-    # so this handles both AEDT and AEST automatically.
-    - cron: "0 6 * * 4"
+  # schedule:
+  #   - cron: "0 6 * * 4"  # DISABLED — running locally on Mac (cloud IPs get blocked by MiClub WAF)
   workflow_dispatch: {}  # Manual trigger only — targets next-next Saturday automatically
 
 jobs:
@@ -59,8 +56,6 @@ jobs:
           MIGOLF_PASS_5: ${{ secrets.MIGOLF_PASS_5 }}
           MIGOLF_USER_6: ${{ secrets.MIGOLF_USER_6 }}
           MIGOLF_PASS_6: ${{ secrets.MIGOLF_PASS_6 }}
-          GMAIL_USER: ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           PYTHONUNBUFFERED: "1"
         run: python -u booking_script_parallel.py
 
