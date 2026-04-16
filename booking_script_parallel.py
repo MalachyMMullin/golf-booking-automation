@@ -85,7 +85,7 @@ MEMBER_TO_FIRST = {
 # All accounts that will enter the draw (credentials from env vars or defaults)
 # Worker order: 2-ball members interleaved early so they're on tee sheet
 # in time to grab the 2-ball after the 4-ball winner is decided.
-# Stagger: 0s, 8m, 16m, 24m, 32m, 40m → all logged in by ~5:55pm
+# Stagger: 0s, 2m, 4m, 6m, 8m, 10m → all logged in by ~6:10pm
 ALL_USERS = [
     {"username": os.getenv("MIGOLF_USER_1", "2007"), "password": os.getenv("MIGOLF_PASS_1", "Golf123#")},
     {"username": os.getenv("MIGOLF_USER_2", "1101"), "password": os.getenv("MIGOLF_PASS_2", "Golf123#")},
@@ -103,12 +103,12 @@ EVENT_LIST_URL = "https://macquarielinks.miclub.com.au/views/members/booking/eve
 HOME_URL       = "https://macquarielinks.miclub.com.au/views/members/home.xhtml"
 LOGOUT_URL     = "https://macquarielinks.miclub.com.au/security/logout.msp"
 
-LOGIN_TIME        = (17, 15)  # login at 5:15pm Sydney (shifted from 17:00)
+LOGIN_TIME        = (18,  0)  # login at 6:00pm Sydney — all workers logged in by ~6:10pm
 QUEUE_JOIN_TIME   = (18, 30)  # ballot opens at 6:30pm — click event link here
 BOOKING_OPEN_TIME = (19,  0)  # tee sheet releases at 7:00pm
 HARD_TIMEOUT_TIME = (20,  0)  # give up at 8:00pm — no earlier
 
-LOGIN_STAGGER_SECS = int(os.getenv("LOGIN_STAGGER_SECS", "480"))      # default 8 min between workers; override via env
+LOGIN_STAGGER_SECS = int(os.getenv("LOGIN_STAGGER_SECS", "120"))      # default 2 min between workers; override via env
 MAX_LOGIN_RETRIES  = 8        # up from 3
 LOGIN_BASE_BACKOFF = 30       # seconds (up from 10)
 LOGIN_MAX_BACKOFF  = 300      # 5-min cap
@@ -2045,15 +2045,18 @@ def worker(
 
     driver = None
     try:
-        driver = make_driver(log=log, worker_index=worker_index)
-
-        # Wait until login time then apply per-worker stagger
+        # Wait until login time then apply per-worker stagger BEFORE creating
+        # the browser — this prevents Chrome from sitting idle for long periods
+        # and crashing (the root cause of "Connection refused" worker deaths).
         wait_until_sydney(LOGIN_TIME[0], LOGIN_TIME[1], "Login gate", log)
         if login_delay > 0:
             jitter = random.uniform(0, 30)
             total_delay = login_delay + jitter
             log.info(f"Stagger delay: {login_delay:.0f}s + {jitter:.0f}s jitter = {total_delay:.0f}s")
             time.sleep(total_delay)
+
+        # Create browser just before login — keeps session fresh
+        driver = make_driver(log=log, worker_index=worker_index)
 
         if not login(driver, username, password, log):
             log.error("Login failed — exiting worker")
@@ -2363,7 +2366,7 @@ def main() -> None:
 
         processes = []
         for idx, user in enumerate(ALL_USERS):
-            delay = idx * LOGIN_STAGGER_SECS  # 0s, 8m, 16m, 24m, 32m, 40m
+            delay = idx * LOGIN_STAGGER_SECS  # 0s, 2m, 4m, 6m, 8m, 10m
             p = multiprocessing.Process(
                 target=worker,
                 args=(
