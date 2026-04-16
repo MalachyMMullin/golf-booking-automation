@@ -75,6 +75,13 @@ MEMBER_TO_SURNAME = {
 }
 SURNAME_TO_MEMBER = {v.lower(): k for k, v in MEMBER_TO_SURNAME.items()}
 
+# First names for Discord notifications (friendlier than surnames)
+MEMBER_TO_FIRST = {
+    "2007": "Malachy", "2008": "Gareth",
+    "2009": "Tommy",   "2010": "Dan",
+    "1101": "Lalor",   "1107": "Cheney",
+}
+
 # All accounts that will enter the draw (credentials from env vars or defaults)
 # Worker order: 2-ball members interleaved early so they're on tee sheet
 # in time to grab the 2-ball after the 4-ball winner is decided.
@@ -101,7 +108,7 @@ QUEUE_JOIN_TIME   = (18, 30)  # ballot opens at 6:30pm — click event link here
 BOOKING_OPEN_TIME = (19,  0)  # tee sheet releases at 7:00pm
 HARD_TIMEOUT_TIME = (20,  0)  # give up at 8:00pm — no earlier
 
-LOGIN_STAGGER_SECS = 480      # 8 min between workers
+LOGIN_STAGGER_SECS = int(os.getenv("LOGIN_STAGGER_SECS", "480"))      # default 8 min between workers; override via env
 MAX_LOGIN_RETRIES  = 8        # up from 3
 LOGIN_BASE_BACKOFF = 30       # seconds (up from 10)
 LOGIN_MAX_BACKOFF  = 300      # 5-min cap
@@ -329,6 +336,36 @@ def has_tee_sheet(driver: webdriver.Chrome) -> bool:
         return False
 
 
+def is_confirmed_logged_out(driver: webdriver.Chrome) -> bool:
+    """Return True only when logout is strongly confirmed.
+
+    Absence of the usual member nav is not enough; MiClub pages can render
+    differently during keepalive hops while the session is still valid.
+    """
+    try:
+        url = (driver.current_url or "").lower()
+    except Exception:
+        url = ""
+    try:
+        title = (driver.title or "").lower()
+    except Exception:
+        title = ""
+    try:
+        body = driver.find_element(By.TAG_NAME, "body").text.lower()
+    except Exception:
+        body = ""
+
+    if "security/login" in url:
+        return True
+    if "your session has expired" in body or "session expired" in body:
+        return True
+    if ("log in" in body or "login" in title) and (
+        "password" in body or "member number" in body or "username" in body
+    ):
+        return True
+    return False
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DATE TARGET  (next-next Saturday from Thursday)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -423,7 +460,7 @@ def login(driver: webdriver.Chrome, username: str, password: str, log: logging.L
         # Circuit breaker: stop after 5 consecutive failures to protect IP
         if consecutive_fails >= 5:
             log.error("Circuit breaker: 5 consecutive login failures — aborting to protect IP")
-            discord_notify(f"🛑 Worker {username}: circuit breaker tripped after 5 login failures", log)
+            discord_notify(f"🛑 {MEMBER_TO_FIRST.get(username, username)}: circuit breaker tripped after 5 login failures", log)
             return False
 
         # Load login page
@@ -489,11 +526,13 @@ def login(driver: webdriver.Chrome, username: str, password: str, log: logging.L
     return False
 
 
-def logout(driver: webdriver.Chrome, log: logging.Logger) -> None:
+def logout(driver: webdriver.Chrome, log: logging.Logger, username: str = "") -> None:
     try:
         driver.get(LOGOUT_URL)
         WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.NAME, "user")))
         log.info("Logged out")
+        if username:
+            discord_notify(f"🚪 {MEMBER_TO_FIRST.get(username, username)} logged out", log)
     except Exception as exc:
         log.warning(f"Logout incomplete: {exc}")
 
@@ -521,6 +560,7 @@ def navigate_and_wait_for_tee_sheet(
     deadline         = hard_deadline_sydney()   # hard stop at 8pm Sydney
     last_status_log  = 0.0
     last_keepalive   = time.time()
+    last_notified_pos = None  # track queue position for Discord updates
 
     while time.time() < deadline:
         now = time.time()
@@ -529,6 +569,7 @@ def navigate_and_wait_for_tee_sheet(
             if has_tee_sheet(driver):
                 log.info("✅ Tee sheet visible!")
                 snap(driver, f"tee_sheet_visible_{username}", log)
+                discord_notify(f"👀 {MEMBER_TO_FIRST.get(username, username)}: tee sheet visible — starting booking!", log)
                 return True
 
             in_draw, countdown = detect_draw(driver)
@@ -546,6 +587,9 @@ def navigate_and_wait_for_tee_sheet(
                 if now - last_status_log > 5:
                     log.info(f"In queue — position {pos}, ~{avail} available. Not refreshing.")
                     last_status_log = now
+                if pos != last_notified_pos:
+                    last_notified_pos = pos
+                    discord_notify(f"📊 {MEMBER_TO_FIRST.get(username, username)}: queue position {pos} (~{avail} available)", log)
                 deadline = max(deadline, time.time() + 300)
                 time.sleep(0.5)
                 continue
@@ -591,7 +635,7 @@ def navigate_and_wait_for_tee_sheet(
                     state = "draw" if in_draw else f"queue (pos {pos})"
                     log.info(f"Entered {state}.")
                     snap(driver, f"entered_{state.replace(' ', '_')}_{username}", log)
-                    discord_notify(f"⏳ Worker {username} entered {state}", log)
+                    discord_notify(f"⏳ {MEMBER_TO_FIRST.get(username, username)} entered {state}", log)
                     in_waiting_room = True
                     continue
 
@@ -626,20 +670,28 @@ def navigate_and_wait_for_tee_sheet(
                 last_status_log = now
 
             # Session keepalive: navigate to home page and back every 5 min
-            # to prevent MiClub from expiring idle sessions
+            # to prevent MiClub from expiring idle sessions.
+            # Important: do NOT panic re-login on weak signals. Only re-login
+            # when logout is confirmed. Once the draw/queue is entered, this
+            # keepalive block is bypassed entirely by the in_waiting_room path.
             if now - last_keepalive > KEEPALIVE_INTERVAL and secs_to_draw > 60:
                 log.info("Session keepalive: navigating to home page and back")
                 try:
                     driver.get(HOME_URL)
                     time.sleep(2)
-                    # Verify still logged in
-                    try:
-                        driver.find_element(By.XPATH, "//a[contains(@href,'logout')]")
-                        log.info("Keepalive OK — session active")
-                    except Exception:
-                        log.warning("Session may have expired — re-logging in")
-                        if not login(driver, _keepalive_username, _keepalive_password, log):
-                            log.error("Re-login failed during keepalive")
+
+                    if is_confirmed_logged_out(driver):
+                        local_now = now_sydney()
+                        relogin_cutoff = local_now.replace(hour=18, minute=57, second=0, microsecond=0)
+                        if local_now <= relogin_cutoff:
+                            log.warning("Confirmed logged out during keepalive — re-logging in")
+                            if not login(driver, _keepalive_username, _keepalive_password, log):
+                                log.error("Re-login failed during keepalive")
+                        else:
+                            log.warning("Confirmed logged out during keepalive, but skipping re-login after 18:57 cutoff")
+                    else:
+                        log.info("Keepalive OK — no confirmed logout")
+
                     driver.get(EVENT_LIST_URL)
                     time.sleep(2)
                 except Exception as exc:
@@ -742,84 +794,121 @@ def _try_select_partners_checkboxes(
     Click the pre-configured 'Select Partners' checkboxes that match the
     required partners by member number or surname.  Returns number of players
     successfully ticked.
+
+    MiClub uses PrimeFaces which hides native <input type="checkbox"> inside
+    <div class="ui-helper-hidden-accessible">.  The visible clickable element
+    is a sibling <div class="ui-chkbox-box">.  We find checkboxes via their
+    <label> text (e.g. "Gareth Hillard") and click the PrimeFaces box.
     """
     target_names = {MEMBER_TO_SURNAME.get(p, p).lower() for p in partners_to_add}
     added = 0
     try:
-        # Checkboxes are rendered as <input type='checkbox'> with adjacent <label> text,
-        # or wrapped in PrimeFaces <div class="ui-chkbox"> with a clickable <div class="ui-chkbox-box">.
-        checkboxes = driver.find_elements(
-            By.XPATH,
-            "//input[@type='checkbox']"
-        )
-        for cb in checkboxes:
-            if not cb.is_displayed():
-                continue
+        # Strategy 1 (Primary): Find PrimeFaces checkbox wrappers via labels.
+        # DOM structure:
+        #   <td>
+        #     <div class="ui-chkbox ui-widget">
+        #       <div class="ui-helper-hidden-accessible">
+        #         <input type="checkbox" id="bookForm:...:0" value="2008">
+        #       </div>
+        #       <div class="ui-chkbox-box ...">  ← click this
+        #         <span class="ui-chkbox-icon ..."></span>
+        #       </div>
+        #     </div>
+        #     <label for="bookForm:...:0">Gareth Hillard</label>
+        #   </td>
+        labels = driver.find_elements(By.XPATH, "//label")
+        for label_el in labels:
             try:
-                # Get label text — look at associated label, parent text, or sibling text
-                cb_id = cb.get_attribute("id") or ""
-                label_el = None
-                label_text = ""
-                if cb_id:
-                    try:
-                        label_el = driver.find_element(By.XPATH, f"//label[@for='{cb_id}']")
-                        label_text = label_el.text.strip().lower()
-                    except Exception:
-                        pass
+                label_text = label_el.text.strip().lower()
                 if not label_text:
-                    try:
-                        label_text = cb.find_element(By.XPATH, "./following-sibling::*[1]").text.strip().lower()
-                    except Exception:
-                        pass
-                if not label_text:
-                    try:
-                        parent = cb.find_element(By.XPATH, "./parent::*")
-                        label_text = parent.text.strip().lower()
-                    except Exception:
-                        pass
+                    continue
+                if not any(name in label_text for name in target_names):
+                    continue
 
-                if any(name in label_text for name in target_names):
-                    if not cb.is_selected():
-                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", cb)
+                # Found a matching label — find the associated checkbox
+                label_for = label_el.get_attribute("for") or ""
+                clicked = False
 
-                        # PrimeFaces checkbox: click the wrapper div, not the raw input
-                        clicked = False
+                # Method A: find the PrimeFaces chkbox-box in the same <td> or parent container
+                if label_for:
+                    try:
+                        cb_input = driver.find_element(By.ID, label_for)
+                        pf_box = cb_input.find_element(
+                            By.XPATH,
+                            "./ancestor::div[contains(@class,'ui-chkbox')][1]"
+                            "//div[contains(@class,'ui-chkbox-box')]"
+                        )
+                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", pf_box)
                         try:
-                            pf_box = cb.find_element(
-                                By.XPATH,
-                                "./ancestor::div[contains(@class,'ui-chkbox')][1]"
-                                "//div[contains(@class,'ui-chkbox-box')]"
-                            )
-                            try:
-                                pf_box.click()
-                            except ElementClickInterceptedException:
-                                driver.execute_script("arguments[0].click();", pf_box)
-                            clicked = True
+                            pf_box.click()
+                        except ElementClickInterceptedException:
+                            driver.execute_script("arguments[0].click();", pf_box)
+                        clicked = True
+                    except Exception:
+                        pass
+
+                # Method B: find ui-chkbox-box as preceding sibling of the label's parent
+                if not clicked:
+                    try:
+                        pf_box = label_el.find_element(
+                            By.XPATH,
+                            "./preceding-sibling::div[contains(@class,'ui-chkbox')]"
+                            "//div[contains(@class,'ui-chkbox-box')]"
+                        )
+                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", pf_box)
+                        try:
+                            pf_box.click()
+                        except ElementClickInterceptedException:
+                            driver.execute_script("arguments[0].click();", pf_box)
+                        clicked = True
+                    except Exception:
+                        pass
+
+                # Method C: click the label itself (fires associated checkbox)
+                if not clicked:
+                    try:
+                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", label_el)
+                        label_el.click()
+                        clicked = True
+                    except Exception:
+                        pass
+
+                if clicked:
+                    log.info(f"Ticked checkbox: {label_text}")
+                    added += 1
+                    time.sleep(0.3)
+            except Exception as e:
+                log.debug(f"Checkbox label check error: {e}")
+
+        # Strategy 2 (Fallback): try native checkbox inputs if Strategy 1 found nothing
+        if added == 0:
+            checkboxes = driver.find_elements(By.XPATH, "//input[@type='checkbox']")
+            for cb in checkboxes:
+                try:
+                    cb_id = cb.get_attribute("id") or ""
+                    label_text = ""
+                    label_el = None
+                    if cb_id:
+                        try:
+                            label_el = driver.find_element(By.XPATH, f"//label[@for='{cb_id}']")
+                            label_text = label_el.text.strip().lower()
+                        except Exception:
+                            pass
+                    if not label_text:
+                        try:
+                            parent = cb.find_element(By.XPATH, "./ancestor::td[1]")
+                            label_text = parent.text.strip().lower()
                         except Exception:
                             pass
 
-                        # Fallback: click the label element (fires associated input)
-                        if not clicked and label_el:
-                            try:
-                                label_el.click()
-                                clicked = True
-                            except Exception:
-                                pass
-
-                        # Final fallback: click raw input via JS
-                        if not clicked:
-                            try:
-                                driver.execute_script("arguments[0].click();", cb)
-                                clicked = True
-                            except Exception:
-                                pass
-
-                        if clicked:
-                            log.info(f"Ticked checkbox: {label_text}")
+                    if label_text and any(name in label_text for name in target_names):
+                        if not cb.is_selected():
+                            driver.execute_script("arguments[0].click();", cb)
+                            log.info(f"Ticked checkbox (native fallback): {label_text}")
                             added += 1
                             time.sleep(0.3)
-            except Exception as e:
-                log.debug(f"Checkbox check error: {e}")
+                except Exception as e:
+                    log.debug(f"Checkbox fallback error: {e}")
     except Exception as exc:
         log.warning(f"Checkbox selection error: {exc}")
 
@@ -904,22 +993,79 @@ def _find_error_player_slots(driver: webdriver.Chrome, log: logging.Logger) -> l
     return results
 
 
+def _remove_player_by_name(driver: webdriver.Chrome, surname: str, log: logging.Logger) -> bool:
+    """
+    Remove a player from the makeBooking page by finding their recordContainer
+    and clicking the glyphicon-remove icon.
+
+    MiClub DOM structure for a filled player slot:
+      <div class="recordContainer recordMade" id="bookForm:record_N">
+        <a class="ui-commandlink ui-widget">
+          <span class="glyphicon glyphicon-remove removeIcon"></span>
+        </a>
+        <span class="booking-name">Hillard, Gareth</span>
+      </div>
+
+    Returns True if removal was successful.
+    """
+    surname_lower = surname.lower()
+    try:
+        # Find all recordContainers with a booking-name span
+        records = driver.find_elements(
+            By.XPATH,
+            "//div[contains(@class,'recordContainer')]"
+        )
+        for record in records:
+            try:
+                name_spans = record.find_elements(
+                    By.XPATH, ".//span[contains(@class,'booking-name')]"
+                )
+                for name_span in name_spans:
+                    if surname_lower in name_span.text.strip().lower():
+                        # Found the player — click the remove icon
+                        remove_link = record.find_element(
+                            By.XPATH,
+                            ".//a[.//span[contains(@class,'removeIcon')]] | "
+                            ".//a[.//span[contains(@class,'glyphicon-remove')]]"
+                        )
+                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", remove_link)
+                        try:
+                            remove_link.click()
+                        except ElementClickInterceptedException:
+                            driver.execute_script("arguments[0].click();", remove_link)
+                        log.info(f"Removed player '{name_span.text.strip()}' via removeIcon")
+                        time.sleep(0.5)
+                        return True
+            except Exception:
+                continue
+    except Exception as exc:
+        log.debug(f"_remove_player_by_name failed: {exc}")
+
+    return False
+
+
 def _remove_player_from_slot(driver: webdriver.Chrome, element, log: logging.Logger) -> bool:
     """
     Given an error element or player slot element, find and click the remove/close button.
-    Tries multiple strategies for PrimeFaces autocomplete widgets.
+    Tries multiple strategies for MiClub's PrimeFaces-based booking page.
     Returns True if removal was successful.
     """
     # Walk up through ancestors looking for a remove/close control
     ancestor_xpaths = [
+        "./ancestor::div[contains(@class,'recordContainer')][1]",
+        "./ancestor::div[contains(@class,'playerCont')][1]",
         "./ancestor::span[contains(@class,'ui-autocomplete')][1]",
         "./ancestor::td[1]",
-        "./ancestor::tr[1]",
         "./ancestor::div[contains(@class,'player') or contains(@class,'slot') or contains(@class,'booking')][1]",
         "./ancestor::div[1]",
     ]
 
     remove_selectors = [
+        # MiClub-specific: glyphicon remove icon (primary)
+        ".//span[contains(@class,'removeIcon')]/..",
+        ".//span[contains(@class,'glyphicon-remove')]/..",
+        # PrimeFaces command link containing remove icon
+        ".//a[contains(@class,'ui-commandlink') and .//span[contains(@class,'removeIcon')]]",
         # PrimeFaces autocomplete close icon
         ".//span[contains(@class,'ui-icon-close')]/..",
         ".//span[contains(@class,'ui-autocomplete-close')]",
@@ -927,8 +1073,6 @@ def _remove_player_from_slot(driver: webdriver.Chrome, element, log: logging.Log
         ".//a[contains(@class,'remove') or contains(@onclick,'remove') or @title='Remove']",
         ".//button[contains(@class,'remove') or contains(@class,'delete')]",
         ".//a[contains(@class,'close') or @title='Close']",
-        # Icon-based close (PrimeFaces)
-        ".//span[contains(@class,'ui-icon-close')]",
     ]
 
     for anc_xpath in ancestor_xpaths:
@@ -988,8 +1132,23 @@ def _clear_already_booked_slots(driver: webdriver.Chrome, log: logging.Logger) -
 
     cleared = 0
     for err in error_elements:
-        log.info(f"Found already-booked error: '{err.text.strip()[:80]}'")
-        if _remove_player_from_slot(driver, err, log):
+        err_text = err.text.strip()[:120]
+        log.info(f"Found already-booked error: '{err_text}'")
+
+        # Try to extract the player surname from the error message
+        # e.g. "Hillard, Gareth - Member is already booked" → surname = "Hillard"
+        removed = False
+        for surname in MEMBER_TO_SURNAME.values():
+            if surname.lower() in err_text.lower():
+                removed = _remove_player_by_name(driver, surname, log)
+                if removed:
+                    break
+
+        # Fallback: ancestor-walk removal from the error element
+        if not removed:
+            removed = _remove_player_from_slot(driver, err, log)
+
+        if removed:
             cleared += 1
         else:
             log.warning("Could not remove already-booked player — slot may still be occupied")
@@ -1092,21 +1251,29 @@ def _search_and_select_player(
             log.warning(f"Player {member_number} ({surname}) is already booked — clearing slot")
             snap(driver, f"already_booked_{member_number}", log)
 
-            # Try to clear this player from the slot
-            # Find the input that now contains the player's name (surname)
-            try:
-                filled_inputs = driver.find_elements(
-                    By.XPATH,
-                    f"//input[contains(@class,'ui-autocomplete-input') and "
-                    f"contains(translate(@value,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),"
-                    f"'{surname.lower()}')]"
-                )
-                for inp in filled_inputs:
-                    if inp.is_displayed():
-                        _remove_player_from_slot(driver, inp, log)
-                        break
-            except Exception as rm_exc:
-                log.debug(f"Could not clear already-booked slot for {surname}: {rm_exc}")
+            # Try to remove this player from the slot
+            # Method 1: Direct removal via recordContainer + removeIcon (MiClub-specific)
+            removed = _remove_player_by_name(driver, surname, log)
+
+            # Method 2: Find the autocomplete input containing the surname and remove via ancestor walk
+            if not removed:
+                try:
+                    filled_inputs = driver.find_elements(
+                        By.XPATH,
+                        f"//input[contains(@class,'ui-autocomplete-input') and "
+                        f"contains(translate(@value,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),"
+                        f"'{surname.lower()}')]"
+                    )
+                    for inp in filled_inputs:
+                        if inp.is_displayed():
+                            if _remove_player_from_slot(driver, inp, log):
+                                removed = True
+                            break
+                except Exception as rm_exc:
+                    log.debug(f"Could not clear already-booked slot for {surname}: {rm_exc}")
+
+            if not removed:
+                log.warning(f"Could not remove already-booked player {surname} — slot may still be occupied")
 
             return "already_booked"
 
@@ -1230,10 +1397,31 @@ def execute_search_booking(
 
         try:
             # ── 1. Find a suitable row ─────────────────────────────────────
-            if not _wait_for_tee_table(driver, log, timeout=60):
-                log.warning("Tee table not ready — refreshing")
-                driver.refresh()
-                time.sleep(4)
+            if not _wait_for_tee_table(driver, log, timeout=10):
+                # Not on tee sheet — likely on event list after a cancel/redirect.
+                # Re-navigate into the event by clicking the target day link.
+                log.warning("Tee table not ready — re-navigating into event")
+                cur_url = driver.current_url or ""
+                if "makeBooking" in cur_url or "eventList" in cur_url or "event.msp" not in cur_url:
+                    driver.get(EVENT_LIST_URL)
+                    time.sleep(2)
+                    try:
+                        # Click the first available event link for the target day
+                        event_links = driver.find_elements(
+                            By.XPATH,
+                            "//div[contains(@class,'full')]//a[contains(@href,'booking_event_id')]"
+                        )
+                        if event_links:
+                            event_links[0].click()
+                            time.sleep(2)
+                    except Exception:
+                        pass
+                else:
+                    driver.refresh()
+                    time.sleep(3)
+                if not _wait_for_tee_table(driver, log, timeout=30):
+                    log.warning("Still no tee table after re-navigation — will retry")
+                    time.sleep(2)
                 continue
 
             rows = driver.find_elements(By.XPATH, "//div[contains(@class,'row-time')]")
@@ -1287,6 +1475,7 @@ def execute_search_booking(
                 if row_id:
                     locked_row_ids.add(row_id)
                 log.info(f"Slot locked (alert: {alert_text}) — skipping row_id={row_id}, trying next slot")
+                discord_notify(f"🔒 {MEMBER_TO_FIRST.get(username, username)}: slot {time_text} locked, trying next", log)
                 driver.refresh()
                 time.sleep(2)
                 continue
@@ -1590,9 +1779,29 @@ def execute_bookgroup_yes_fallback(
             locked_clear_time = time.time() + 30
 
         try:
-            if not _wait_for_tee_table(driver, log, timeout=60):
-                driver.refresh()
-                time.sleep(4)
+            if not _wait_for_tee_table(driver, log, timeout=10):
+                # Re-navigate into the event
+                log.warning("Fallback: tee table not ready — re-navigating into event")
+                cur_url = driver.current_url or ""
+                if "event.msp" not in cur_url or "makeBooking" in cur_url or "eventList" in cur_url:
+                    driver.get(EVENT_LIST_URL)
+                    time.sleep(2)
+                    try:
+                        event_links = driver.find_elements(
+                            By.XPATH,
+                            "//div[contains(@class,'full')]//a[contains(@href,'booking_event_id')]"
+                        )
+                        if event_links:
+                            event_links[0].click()
+                            time.sleep(2)
+                    except Exception:
+                        pass
+                else:
+                    driver.refresh()
+                    time.sleep(3)
+                if not _wait_for_tee_table(driver, log, timeout=30):
+                    log.warning("Fallback: still no tee table after re-navigation")
+                    time.sleep(2)
                 continue
 
             # Find first row with enough empty slots
@@ -1848,10 +2057,10 @@ def worker(
 
         if not login(driver, username, password, log):
             log.error("Login failed — exiting worker")
-            discord_notify(f"❌ Worker {username}: login failed after {MAX_LOGIN_RETRIES} attempts", log)
+            discord_notify(f"❌ {MEMBER_TO_FIRST.get(username, username)}: login failed after {MAX_LOGIN_RETRIES} attempts", log)
             return
 
-        discord_notify(f"🔑 Worker {username} logged in", log)
+        discord_notify(f"🔑 {MEMBER_TO_FIRST.get(username, username)} logged in", log)
 
         if not navigate_and_wait_for_tee_sheet(driver, target_day, target_date, log, username, password):
             log.error("Could not reach tee sheet — exiting worker")
@@ -1860,13 +2069,31 @@ def worker(
         # ── Attempt 4-ball ────────────────────────────────────────────────
         if not fourball_booked.is_set():
             partners_4 = get_fourball_partners(username)
-            log.info(f"Attempting 4-ball (search method). Adding: {partners_4}")
-            success, row_id = execute_search_booking(driver, username, partners_4, 4, log,
-                                                      cancel_event=fourball_booked)
+            row_id = ""
+
+            # Only 4-ball members (2007-2010) have pre-configured default partners
+            # matching the group, so they should use the fast "Yes" path first.
+            is_fourball_member = username in FOUR_BALL_MEMBERS
+            if is_fourball_member:
+                log.info(f"Attempting 4-ball (Book Group → Yes — fast path). Partners: {partners_4}")
+                discord_notify(f"🎯 {MEMBER_TO_FIRST.get(username, username)} attempting 4-ball booking (fast)...", log)
+                success = execute_bookgroup_yes_fallback(driver, username, 4, log,
+                                                          cancel_event=fourball_booked)
+                if success:
+                    # extract row_id from current URL if on makeBooking/tee sheet
+                    try:
+                        url_match = re.search(r"booking_row_id=(\d+)", driver.current_url)
+                        if url_match:
+                            row_id = url_match.group(1)
+                    except Exception:
+                        pass
+            else:
+                success = False
 
             if not success and not fourball_booked.is_set():
-                log.warning("Search booking failed — trying Book Group → Yes fallback")
-                success = execute_bookgroup_yes_fallback(driver, username, 4, log,
+                log.info(f"Attempting 4-ball (search method — manual partner add). Adding: {partners_4}")
+                discord_notify(f"🎯 {MEMBER_TO_FIRST.get(username, username)} attempting 4-ball booking (search)...", log)
+                success, row_id = execute_search_booking(driver, username, partners_4, 4, log,
                                                           cancel_event=fourball_booked)
 
             if success and not fourball_booked.is_set():
@@ -1882,8 +2109,8 @@ def worker(
                 log.info(f"🏆 4-ball booked by {username}!")
                 fourball_partners = get_fourball_partners(username)
                 all_fourball = [username] + fourball_partners
-                names = [MEMBER_TO_SURNAME.get(m, m) for m in all_fourball]
-                caption = f"✅ 4-ball BOOKED by {MEMBER_TO_SURNAME.get(username, username)}!\nPlayers: {', '.join(names)}"
+                names = [MEMBER_TO_FIRST.get(m, m) for m in all_fourball]
+                caption = f"✅ 4-ball BOOKED by {MEMBER_TO_FIRST.get(username, username)}!\nPlayers: {', '.join(names)}"
                 discord_notify(caption, log)
                 # Upload tee sheet screenshot showing the booking
                 ss_path = RUN_DIR / f"fourball_confirmed_{username}.png"
@@ -1894,7 +2121,7 @@ def worker(
                     log.warning(f"Failed to capture/upload 4-ball screenshot: {exc}")
                 # Only the winning worker logs out — others stay on tee sheet
                 # in case they're ahead in queue for other bookings
-                logout(driver, log)
+                logout(driver, log, username)
                 return
             log.info("4-ball attempt complete (may have been taken by another worker)")
         else:
@@ -1903,7 +2130,7 @@ def worker(
         # ── Attempt 2-ball (ANY worker who is through can attempt this) ────
         if twoball_booked.is_set():
             log.info("2-ball already booked — nothing left to do.")
-            logout(driver, log)
+            logout(driver, log, username)
             return
 
         if not twoball_booked.is_set():
@@ -1926,6 +2153,7 @@ def worker(
                 log.warning(f"Failed to read fourball_row_id_val: {exc}")
                 skip_ids = set()
             log.info(f"Attempting 2-ball (search method). Adding: {partners_2}")
+            discord_notify(f"🎯 {MEMBER_TO_FIRST.get(username, username)} attempting 2-ball booking...", log)
             success, _ = execute_search_booking(
                 driver,
                 username,
@@ -1945,8 +2173,8 @@ def worker(
             if success and not twoball_booked.is_set():
                 twoball_booked.set()
                 log.info(f"🏆 2-ball booked by {username}!")
-                twoball_names = [MEMBER_TO_SURNAME.get(username, username)] + [MEMBER_TO_SURNAME.get(p, p) for p in partners_2]
-                caption = f"✅ 2-ball BOOKED by {MEMBER_TO_SURNAME.get(username, username)}!\nPlayers: {', '.join(twoball_names)}"
+                twoball_names = [MEMBER_TO_FIRST.get(username, username)] + [MEMBER_TO_FIRST.get(p, p) for p in partners_2]
+                caption = f"✅ 2-ball BOOKED by {MEMBER_TO_FIRST.get(username, username)}!\nPlayers: {', '.join(twoball_names)}"
                 discord_notify(caption, log)
                 # Upload tee sheet screenshot showing the booking
                 ss_path = RUN_DIR / f"twoball_confirmed_{username}.png"
@@ -1955,18 +2183,19 @@ def worker(
                     discord_upload_screenshot(str(ss_path), "2-ball booking confirmed — tee sheet:", log)
                 except Exception as exc:
                     log.warning(f"Failed to capture/upload 2-ball screenshot: {exc}")
-                logout(driver, log)
+                logout(driver, log, username)
                 return
             log.info("2-ball attempt complete — both bookings likely handled by other workers")
 
-        logout(driver, log)
+        logout(driver, log, username)
 
     except Exception as exc:
         log.exception(f"Worker crashed: {exc}")
+        discord_notify(f"💥 {MEMBER_TO_FIRST.get(username, username)} crashed: {exc}", log)
     finally:
         if driver:
             try:
-                logout(driver, log)
+                logout(driver, log, username)
             except Exception:
                 pass
             try:
