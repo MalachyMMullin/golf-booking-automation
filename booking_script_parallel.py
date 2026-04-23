@@ -399,6 +399,7 @@ def make_driver(log: Optional[logging.Logger] = None, worker_index: int = 0) -> 
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--disable-extensions")
+    opts.add_argument("--ignore-certificate-errors")
 
     # Per-worker fingerprint diversification
     ua = USER_AGENTS[worker_index % len(USER_AGENTS)]
