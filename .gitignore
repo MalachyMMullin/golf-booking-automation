@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 .env
 *.bak_test
+.venv/
+.DS_Store

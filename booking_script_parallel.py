@@ -785,11 +785,164 @@ def _find_empty_player_inputs(driver: webdriver.Chrome, log: Optional[logging.Lo
         return []
 
 
+def _member_surnames(member_numbers: List[str]) -> List[str]:
+    return [MEMBER_TO_SURNAME.get(m, m) for m in member_numbers]
+
+
+def _page_contains_members(driver: webdriver.Chrome, member_numbers: List[str]) -> bool:
+    """Return True when all supplied members' surnames are visible on the page."""
+    if not member_numbers:
+        return True
+    try:
+        body_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+    except Exception:
+        body_text = ""
+    return all(surname.lower() in body_text for surname in _member_surnames(member_numbers))
+
+
+def _row_contains_members(driver: webdriver.Chrome, row_id: str, member_numbers: List[str]) -> bool:
+    """Return True when all supplied members' surnames are visible in one tee-sheet row."""
+    if not member_numbers:
+        return True
+    if not row_id:
+        return _page_contains_members(driver, member_numbers)
+    try:
+        row = driver.find_element(By.ID, f"row-{row_id}")
+        row_text = row.text.lower()
+    except Exception:
+        return False
+    return all(surname.lower() in row_text for surname in _member_surnames(member_numbers))
+
+
+def _booking_confirmed_for_members(
+    driver: webdriver.Chrome,
+    row_id: str,
+    member_numbers: List[str],
+    log: logging.Logger,
+    timeout: int = 45,
+) -> bool:
+    """Wait for MiClub to finish confirmation and verify the target row."""
+    success_phrases = [
+        "booking has been made", "successfully booked",
+        "booking successful", "booking confirmed",
+    ]
+    deadline = time.time() + timeout
+    last_log = 0.0
+
+    while time.time() < deadline:
+        alerted, alert_text = safe_accept_alert(driver)
+        if alerted:
+            alert_lower = alert_text.lower()
+            if any(p in alert_lower for p in success_phrases):
+                log.info(f"Success alert after confirm: {alert_text}")
+            else:
+                log.warning(f"Alert after confirm: {alert_text}")
+                return False
+
+        try:
+            body_text = driver.find_element(By.TAG_NAME, "body").text
+        except Exception:
+            body_text = ""
+        body_lower = body_text.lower()
+
+        if has_tee_sheet(driver):
+            if _row_contains_members(driver, row_id, member_numbers):
+                return True
+        elif any(p in body_lower for p in success_phrases):
+            if _page_contains_members(driver, member_numbers):
+                return True
+
+        now = time.time()
+        if now - last_log > 5:
+            log.info("Waiting for booking confirmation redirect/result...")
+            last_log = now
+        time.sleep(0.5)
+
+    return False
+
+
+def _selected_player_surnames(driver: webdriver.Chrome) -> set:
+    """Read visible selected golfers from makeBooking.xhtml."""
+    surnames = set()
+    try:
+        for el in driver.find_elements(
+            By.XPATH,
+            "//span[contains(@class,'booking-name')] | "
+            "//div[contains(@class,'recordContainer')] | "
+            "//input[contains(@class,'ui-autocomplete-input')]"
+        ):
+            text = ((el.text or "") + " " + (el.get_attribute("value") or "")).lower()
+            for surname in MEMBER_TO_SURNAME.values():
+                if surname.lower() in text:
+                    surnames.add(surname.lower())
+    except Exception:
+        pass
+    return surnames
+
+
+def _wait_for_selected_members(
+    driver: webdriver.Chrome,
+    member_numbers: List[str],
+    log: logging.Logger,
+    timeout: int = 8,
+) -> bool:
+    """Wait for selected players to appear in the visible booking slots."""
+    expected = {MEMBER_TO_SURNAME.get(m, m).lower() for m in member_numbers}
+    deadline = time.time() + timeout
+    last_seen = set()
+    while time.time() < deadline:
+        last_seen = _selected_player_surnames(driver)
+        if expected.issubset(last_seen):
+            return True
+        time.sleep(0.5)
+    log.info(f"Selected player wait ended. Expected={sorted(expected)}, visible={sorted(last_seen)}")
+    return expected.issubset(last_seen)
+
+
+def _cancel_booking_form(driver: webdriver.Chrome, log: logging.Logger) -> None:
+    try:
+        cancel = driver.find_element(
+            By.XPATH,
+            "//a[normalize-space()='CANCEL'] | //button[normalize-space()='Cancel'] | "
+            "//a[contains(normalize-space(.),'Cancel')]"
+        )
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", cancel)
+        try:
+            cancel.click()
+        except ElementClickInterceptedException:
+            driver.execute_script("arguments[0].click();", cancel)
+    except Exception:
+        log.info("Cancel button not found — returning to event list")
+        driver.get(EVENT_LIST_URL)
+
+
+def _wait_for_make_booking(driver: webdriver.Chrome, log: logging.Logger, timeout: int = 165) -> bool:
+    """Wait inside MiClub's short reservation window for makeBooking.xhtml."""
+    deadline = time.time() + timeout
+    last_log = 0.0
+    while time.time() < deadline:
+        if "makeBooking" in (driver.current_url or ""):
+            return True
+        alerted, alert_text = safe_accept_alert(driver)
+        if alerted:
+            log.warning(f"Alert while waiting for makeBooking: {alert_text}")
+            return False
+        if has_tee_sheet(driver):
+            # Still on the tee sheet; the modal/redirect may not have completed yet.
+            pass
+        now = time.time()
+        if now - last_log > 15:
+            log.info(f"Waiting for makeBooking page ({int(deadline - now)}s reservation window left)")
+            last_log = now
+        time.sleep(0.5)
+    return False
+
+
 def _try_select_partners_checkboxes(
     driver: webdriver.Chrome,
     partners_to_add: List[str],
     log: logging.Logger,
-) -> int:
+) -> List[str]:
     """
     Click the pre-configured 'Select Partners' checkboxes that match the
     required partners by member number or surname.  Returns number of players
@@ -800,8 +953,8 @@ def _try_select_partners_checkboxes(
     is a sibling <div class="ui-chkbox-box">.  We find checkboxes via their
     <label> text (e.g. "Gareth Hillard") and click the PrimeFaces box.
     """
-    target_names = {MEMBER_TO_SURNAME.get(p, p).lower() for p in partners_to_add}
-    added = 0
+    target_names = {MEMBER_TO_SURNAME.get(p, p).lower(): p for p in partners_to_add}
+    added_members: List[str] = []
     try:
         # Strategy 1 (Primary): Find PrimeFaces checkbox wrappers via labels.
         # DOM structure:
@@ -822,33 +975,42 @@ def _try_select_partners_checkboxes(
                 label_text = label_el.text.strip().lower()
                 if not label_text:
                     continue
-                if not any(name in label_text for name in target_names):
+                matched_member = None
+                for surname, member_num in target_names.items():
+                    if surname in label_text:
+                        matched_member = member_num
+                        break
+                if not matched_member or matched_member in added_members:
                     continue
 
                 # Found a matching label — find the associated checkbox
                 label_for = label_el.get_attribute("for") or ""
                 clicked = False
+                already_selected = False
 
                 # Method A: find the PrimeFaces chkbox-box in the same <td> or parent container
                 if label_for:
                     try:
                         cb_input = driver.find_element(By.ID, label_for)
-                        pf_box = cb_input.find_element(
-                            By.XPATH,
-                            "./ancestor::div[contains(@class,'ui-chkbox')][1]"
-                            "//div[contains(@class,'ui-chkbox-box')]"
-                        )
-                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", pf_box)
-                        try:
-                            pf_box.click()
-                        except ElementClickInterceptedException:
-                            driver.execute_script("arguments[0].click();", pf_box)
-                        clicked = True
+                        already_selected = cb_input.is_selected()
+                        if not already_selected:
+                            pf_box = cb_input.find_element(
+                                By.XPATH,
+                                "./ancestor::div[contains(@class,'ui-chkbox')][1]"
+                                "//div[contains(@class,'ui-chkbox-box')]"
+                            )
+                            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", pf_box)
+                            try:
+                                pf_box.click()
+                            except ElementClickInterceptedException:
+                                driver.execute_script("arguments[0].click();", pf_box)
+                            WebDriverWait(driver, 3).until(lambda _d: cb_input.is_selected())
+                            clicked = True
                     except Exception:
                         pass
 
                 # Method B: find ui-chkbox-box as preceding sibling of the label's parent
-                if not clicked:
+                if not clicked and not already_selected:
                     try:
                         pf_box = label_el.find_element(
                             By.XPATH,
@@ -865,7 +1027,7 @@ def _try_select_partners_checkboxes(
                         pass
 
                 # Method C: click the label itself (fires associated checkbox)
-                if not clicked:
+                if not clicked and not already_selected:
                     try:
                         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", label_el)
                         label_el.click()
@@ -873,15 +1035,16 @@ def _try_select_partners_checkboxes(
                     except Exception:
                         pass
 
-                if clicked:
-                    log.info(f"Ticked checkbox: {label_text}")
-                    added += 1
+                if clicked or already_selected:
+                    action = "Already selected checkbox" if already_selected else "Ticked checkbox"
+                    log.info(f"{action}: {label_text}")
+                    added_members.append(matched_member)
                     time.sleep(0.3)
             except Exception as e:
                 log.debug(f"Checkbox label check error: {e}")
 
         # Strategy 2 (Fallback): try native checkbox inputs if Strategy 1 found nothing
-        if added == 0:
+        if not added_members:
             checkboxes = driver.find_elements(By.XPATH, "//input[@type='checkbox']")
             for cb in checkboxes:
                 try:
@@ -901,19 +1064,27 @@ def _try_select_partners_checkboxes(
                         except Exception:
                             pass
 
-                    if label_text and any(name in label_text for name in target_names):
+                    matched_member = None
+                    for surname, member_num in target_names.items():
+                        if surname in label_text:
+                            matched_member = member_num
+                            break
+                    if label_text and matched_member and matched_member not in added_members:
                         if not cb.is_selected():
                             driver.execute_script("arguments[0].click();", cb)
+                            WebDriverWait(driver, 3).until(lambda _d: cb.is_selected())
                             log.info(f"Ticked checkbox (native fallback): {label_text}")
-                            added += 1
-                            time.sleep(0.3)
+                        else:
+                            log.info(f"Already selected checkbox (native fallback): {label_text}")
+                        added_members.append(matched_member)
+                        time.sleep(0.3)
                 except Exception as e:
                     log.debug(f"Checkbox fallback error: {e}")
     except Exception as exc:
         log.warning(f"Checkbox selection error: {exc}")
 
     # If we ticked any checkboxes, click the "Select Partners" button to confirm them
-    if added > 0:
+    if added_members:
         try:
             select_btn = driver.find_element(
                 By.XPATH,
@@ -926,12 +1097,12 @@ def _try_select_partners_checkboxes(
                 select_btn.click()
             except ElementClickInterceptedException:
                 driver.execute_script("arguments[0].click();", select_btn)
-            log.info(f"Clicked 'Select Partners' button ({added} partners ticked)")
+            log.info(f"Clicked 'Select Partners' button ({len(added_members)} partners ticked)")
             time.sleep(1.0)
         except Exception as e:
-            log.debug(f"'Select Partners' button not found or click failed: {e}")
+            log.warning(f"'Select Partners' button not found or click failed: {e}")
 
-    return added
+    return added_members
 
 
 def _find_error_player_slots(driver: webdriver.Chrome, log: logging.Logger) -> list:
@@ -1208,7 +1379,24 @@ def _search_and_select_player(
             else:
                 return "not_found"
         else:
-            log.info(f"Selecting: {result.text.strip()}")
+            result_text = result.text.strip()
+            result_text_lower = result_text.lower()
+            if surname.lower() not in result_text_lower and member_number not in result_text_lower:
+                matching = [
+                    c for c in visible
+                    if surname.lower() in c.text.lower() or member_number in c.text
+                ]
+                if matching:
+                    result = matching[0]
+                    result_text = result.text.strip()
+                else:
+                    log.warning(
+                        f"Autocomplete result did not match {member_number} ({surname}): "
+                        f"{result_text!r}"
+                    )
+                    input_el.clear()
+                    return "not_found"
+            log.info(f"Selecting: {result_text}")
             try:
                 result.click()
             except ElementClickInterceptedException:
@@ -1296,8 +1484,8 @@ def _search_and_select_player(
         except Exception:
             pass
 
-        log.info(f"Player {member_number} selection status unclear — assuming ok")
-        return "ok"
+        log.warning(f"Player {member_number} selection status unclear — treating as not selected")
+        return "not_found"
 
     except Exception as exc:
         log.error(f"Search/select failed for {member_number}: {exc}")
@@ -1498,9 +1686,7 @@ def execute_search_booking(
                 log.warning("Group modal didn't appear — might have gone direct to booking page")
 
             # ── 4. Wait for makeBooking.xhtml ──────────────────────────────
-            try:
-                WebDriverWait(driver, 15).until(lambda d: "makeBooking" in d.current_url)
-            except TimeoutException:
+            if not _wait_for_make_booking(driver, log):
                 # Some cases: slot already booked or redirect didn't happen
                 log.warning(f"makeBooking URL not reached — current: {driver.current_url}")
                 snap(driver, f"attempt{attempt}_no_makebooking", log)
@@ -1545,13 +1731,15 @@ def execute_search_booking(
             _reveal_player_inputs(driver, log)
             time.sleep(0.5)
 
-            ticked = _try_select_partners_checkboxes(driver, partners_to_add, log)
-            log.info(f"Checkbox strategy: ticked {ticked}/{len(partners_to_add)} partners")
+            selected_members = [username]
+            ticked_members = _try_select_partners_checkboxes(driver, partners_to_add, log)
+            selected_members.extend(m for m in ticked_members if m not in selected_members)
+            log.info(f"Checkbox strategy: ticked {len(ticked_members)}/{len(partners_to_add)} partners")
 
             # Check how many Find Player inputs are still empty after checkboxes
             still_empty = _find_empty_player_inputs(driver, log)
             log.info(f"Empty Find Player inputs remaining after checkboxes: {len(still_empty)} "
-                     f"(need {len(partners_to_add) - ticked} more via search)")
+                     f"(need {len(partners_to_add) - len(ticked_members)} more via search)")
 
             # Diagnostic: log what the current page inputs look like
             try:
@@ -1564,16 +1752,10 @@ def execute_search_booking(
             except Exception:
                 pass
 
-            # Strategy B: autocomplete search — build a queue of partners to try.
-            # Primary partners first, then alternates (other group members not in this booking).
-            remaining_partners = partners_to_add[ticked:] if ticked < len(partners_to_add) else []
-
-            # Build alternate partner pool: all known members except the logged-in user
-            # and those already in the primary partner list
-            primary_set = set(partners_to_add) | {username}
-            alternate_partners = [m for m in MEMBER_TO_SURNAME.keys()
-                                  if m not in primary_set]
-            partner_queue = list(remaining_partners) + alternate_partners
+            # Strategy B: autocomplete search — only use the exact required partners.
+            # Substituting alternates makes the shared 4-ball roster unsafe.
+            remaining_partners = [m for m in partners_to_add if m not in selected_members]
+            partner_queue = list(remaining_partners)
 
             partners_added_by_search = 0
             attempted: set = set()
@@ -1590,7 +1772,7 @@ def execute_search_booking(
                     break
 
                 # We've added enough partners already
-                needed = len(partners_to_add) - ticked - partners_added_by_search
+                needed = required_slots - len(selected_members)
                 if needed <= 0:
                     break
 
@@ -1598,14 +1780,16 @@ def execute_search_booking(
 
                 if result == "ok":
                     partners_added_by_search += 1
+                    if member_num not in selected_members:
+                        selected_members.append(member_num)
                     time.sleep(0.3)
                 elif result == "already_booked":
-                    log.warning(f"Player {member_num} already booked — trying next in queue")
+                    log.warning(f"Player {member_num} already booked — exact roster cannot be completed")
                     skipped.append(member_num)
                     # _search_and_select_player already attempted slot cleanup;
                     # double-check and clear any lingering errors
                     _clear_already_booked_slots(driver, log)
-                    continue
+                    break
                 elif result == "not_found":
                     log.warning(f"Player {member_num} not found in autocomplete — skipping")
                     skipped.append(member_num)
@@ -1619,20 +1803,21 @@ def execute_search_booking(
                 log.info(f"Skipped members: {skipped}. Proceeding with {partners_added_by_search} added by search.")
 
             # Safety check: use explicit count of partners added, not empty-input inference
-            total_partners_added = ticked + partners_added_by_search
+            _wait_for_selected_members(driver, selected_members, log)
+            selected_surnames = _selected_player_surnames(driver)
+            expected_surnames = {MEMBER_TO_SURNAME.get(m, m).lower() for m in selected_members}
+            visible_selected = selected_surnames & expected_surnames
+            total_partners_added = len(selected_members) - 1
             log.info(f"Partner tally: {total_partners_added}/{len(partners_to_add)} "
-                     f"(checkbox={ticked}, search={partners_added_by_search})")
-            if total_partners_added < 1 and required_slots > 1:
-                log.warning(f"Only {total_partners_added} partners added (need at least 1) "
-                            f"— cancelling and retrying slot")
-                try:
-                    cancel = driver.find_element(
-                        By.XPATH,
-                        "//a[normalize-space()='CANCEL'] | //button[normalize-space()='Cancel']"
-                    )
-                    cancel.click()
-                except Exception:
-                    driver.get(EVENT_LIST_URL)
+                     f"(checkbox={len(ticked_members)}, search={partners_added_by_search})")
+            log.info(f"Visible selected golfers: {sorted(selected_surnames)}")
+            if len(selected_members) < required_slots or not expected_surnames.issubset(selected_surnames):
+                log.warning(
+                    f"Selected golfers are incomplete or not visible before confirm. "
+                    f"Expected {sorted(expected_surnames)}, visible match {sorted(visible_selected)} "
+                    f"— cancelling and retrying slot"
+                )
+                _cancel_booking_form(driver, log)
                 time.sleep(2)
                 continue
 
@@ -1664,39 +1849,15 @@ def execute_search_booking(
 
             # ── 7. Verify success ───────────────────────────────────────────
             snap(driver, f"attempt{attempt}_post_confirm", log)
-            alerted, alert_text = safe_accept_alert(driver)
-
-            try:
-                body_text = driver.find_element(By.TAG_NAME, "body").text
-            except Exception:
-                body_text = ""
-
-            success_phrases = [
-                "booking has been made", "successfully booked",
-                "booking successful", "booking confirmed",
-            ]
-            if alerted and any(p in alert_text.lower() for p in success_phrases):
-                log.info(f"✅ BOOKED via alert: {alert_text}")
-                return True, row_id
-            if any(p in body_text.lower() for p in success_phrases):
-                log.info("✅ BOOKED (page text confirms).")
-                return True, row_id
-
-            # Redirect back to tee sheet often means success
-            if has_tee_sheet(driver):
-                log.info("✅ Redirected to tee sheet — assuming booking succeeded.")
+            if _booking_confirmed_for_members(driver, row_id, selected_members, log):
                 snap(driver, f"attempt{attempt}_teesheet_post_confirm", log)
+                log.info("✅ BOOKED — tee sheet row shows expected golfers.")
                 return True, row_id
 
-            # Slot may have been taken mid-booking
-            if alerted and alert_text:
-                log.warning(f"Alert after confirm: {alert_text} — retrying")
-                driver.get(EVENT_LIST_URL)
-                time.sleep(2)
-                continue
-
-            log.warning("Booking status unclear — assuming success to avoid double-booking")
-            return True, row_id
+            log.warning("Booking was not confirmed on the target row — retrying")
+            driver.get(EVENT_LIST_URL)
+            time.sleep(2)
+            continue
 
         except StaleElementReferenceException:
             log.warning("Stale element — refreshing")
@@ -1748,7 +1909,8 @@ def execute_bookgroup_yes_fallback(
     log: logging.Logger,
     skip_row_ids: Optional[set] = None,
     cancel_event: Optional[multiprocessing.Event] = None,
-) -> bool:
+    expected_members: Optional[List[str]] = None,
+) -> Tuple[bool, str]:
     """
     Fallback booking method: click BOOK GROUP → Yes (uses MiClub pre-configured group).
 
@@ -1758,18 +1920,20 @@ def execute_bookgroup_yes_fallback(
       - Find and remove the problematic player (click their red X)
       - Confirm with the remaining players
 
-    Returns True on success.
+    Returns (success, row_id).
     """
     log.info("▶ FALLBACK: Book Group → Yes method")
     deadline = hard_deadline_sydney()
     attempt  = 0
     locked_row_ids: set = set()
     locked_clear_time = time.time() + 30
+    expected_members = expected_members or []
+    expected_booking_members = [username] + [m for m in expected_members if m != username]
 
     while attempt < BOOKING_MAX_ATTEMPTS and time.time() < deadline:
         if cancel_event and cancel_event.is_set():
             log.info("Another worker already completed this booking — aborting fallback.")
-            return False
+            return False, ""
         attempt += 1
         log.info(f"Fallback attempt {attempt}...")
 
@@ -1807,6 +1971,7 @@ def execute_bookgroup_yes_fallback(
             # Find first row with enough empty slots
             rows = driver.find_elements(By.XPATH, "//div[contains(@class,'row-time')]")
             target_row = None
+            row_id = ""
             for row in rows:
                 try:
                     empties = row.find_elements(By.XPATH, ".//button[contains(@class,'btn-book-me')]")
@@ -1819,6 +1984,7 @@ def execute_bookgroup_yes_fallback(
                             log.info(f"Fallback: skipping row_id={candidate_id} (locked by another user)")
                             continue
                         target_row = row
+                        row_id = candidate_id
                         break
                 except StaleElementReferenceException:
                     continue
@@ -1933,10 +2099,10 @@ def execute_bookgroup_yes_fallback(
                         confirm.click()
                         time.sleep(1.5)
                         snap(driver, f"fallback{attempt}_post_confirm_remove", log)
-                        alerted2, alert_text2 = safe_accept_alert(driver)
-                        if has_tee_sheet(driver) or alerted2:
+                        if _booking_confirmed_for_members(driver, row_id, expected_booking_members, log):
                             log.info("✅ Fallback: booked (after removing already-booked player)")
-                            return True
+                            return True, row_id
+                        log.warning("Fallback: remove flow did not confirm expected golfers on target row")
                     except Exception as e3:
                         log.warning(f"Fallback: remove-and-rebook failed: {e3}")
                         driver.get(EVENT_LIST_URL)
@@ -1948,22 +2114,12 @@ def execute_bookgroup_yes_fallback(
                     time.sleep(2)
                     continue
 
-            # No alert — check for success
+            # No alert — wait for MiClub to finish the booking request
             snap(driver, f"fallback{attempt}_post_yes", log)
-            try:
-                body_text = driver.find_element(By.TAG_NAME, "body").text
-            except Exception:
-                body_text = ""
-            success_phrases = [
-                "booking has been made", "successfully booked",
-                "booking successful", "booking confirmed",
-            ]
-            if any(p in body_text.lower() for p in success_phrases):
-                log.info("✅ Fallback: booking confirmed (page text).")
-                return True
-            if has_tee_sheet(driver):
-                log.info("✅ Fallback: redirected to tee sheet — assuming success.")
-                return True
+            if _booking_confirmed_for_members(driver, row_id, expected_booking_members, log):
+                log.info("✅ Fallback: booking confirmed on target row.")
+                return True, row_id
+
             # Might be on makeBooking page (modal went direct to booking form)
             if "makeBooking" in driver.current_url:
                 try:
@@ -1977,10 +2133,10 @@ def execute_bookgroup_yes_fallback(
                     )
                     confirm.click()
                     time.sleep(1.5)
-                    alerted3, _ = safe_accept_alert(driver)
-                    if has_tee_sheet(driver) or alerted3:
+                    if _booking_confirmed_for_members(driver, row_id, expected_booking_members, log):
                         log.info("✅ Fallback: booking confirmed via makeBooking confirm.")
-                        return True
+                        return True, row_id
+                    log.warning("Fallback: makeBooking confirm did not verify expected golfers on target row")
                 except Exception:
                     pass
 
@@ -1997,7 +2153,7 @@ def execute_bookgroup_yes_fallback(
             time.sleep(5)
 
     log.error("Fallback booking also failed.")
-    return False
+    return False, ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2016,13 +2172,52 @@ def get_fourball_partners(username: str) -> List[str]:
     return base
 
 
-def get_twoball_partner(username: str, fourball_winner: str) -> List[str]:
-    """Return the partner(s) for the 2-ball, given who won the 4-ball."""
-    # The 4 people in the 4-ball are: fourball_winner + get_fourball_partners(fourball_winner)
-    in_fourball = {fourball_winner} | set(get_fourball_partners(fourball_winner))
-    # Everyone else should be in the 2-ball
-    remaining = [u["username"] for u in ALL_USERS if u["username"] not in in_fourball and u["username"] != username]
-    return remaining[:1]  # Only need 1 partner for a 2-ball
+def member_display(member_numbers: List[str]) -> str:
+    """Human-readable member list for logs and Discord."""
+    return ", ".join(
+        f"{MEMBER_TO_FIRST.get(m, MEMBER_TO_SURNAME.get(m, m))} ({m})"
+        for m in member_numbers
+    )
+
+
+def encode_member_list(member_numbers: List[str]) -> bytes:
+    return ",".join(member_numbers).encode("utf-8")
+
+
+def decode_member_list(raw) -> List[str]:
+    try:
+        text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    except Exception:
+        return []
+    return [p.strip() for p in text.rstrip("\x00").split(",") if p.strip()]
+
+
+def get_fourball_members(username: str) -> List[str]:
+    """Return the exact expected 4-ball roster for the winning account."""
+    partners = get_fourball_partners(username)
+    return [username] + [m for m in partners if m != username]
+
+
+def get_twoball_partner_from_verified_roster(
+    username: str,
+    verified_fourball_members: List[str],
+) -> Tuple[List[str], List[str], str]:
+    """Return a 2-ball partner only when this worker is one of the two remaining golfers."""
+    if len(verified_fourball_members) != 4:
+        return [], [], "4-ball roster not verified"
+
+    in_fourball = set(verified_fourball_members)
+    all_members = [u["username"] for u in ALL_USERS]
+    remaining = [m for m in all_members if m not in in_fourball]
+
+    if username in in_fourball:
+        return [], remaining, "already in verified 4-ball"
+    if username not in remaining:
+        return [], remaining, "not one of the remaining golfers"
+    if len(remaining) != 2:
+        return [], remaining, f"expected 2 remaining golfers, found {len(remaining)}"
+
+    return [m for m in remaining if m != username][:1], remaining, "eligible"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2035,8 +2230,10 @@ def worker(
     target_date: str,
     fourball_booked: multiprocessing.Event,
     twoball_booked: multiprocessing.Event,
+    fourball_verified: multiprocessing.Event,
     fourball_winner_val: multiprocessing.Value,
     fourball_row_id_val: multiprocessing.Value,
+    fourball_members_val: multiprocessing.Value,
     worker_index: int = 0,
     login_delay: float = 0.0,
 ) -> None:
@@ -2080,16 +2277,14 @@ def worker(
             if is_fourball_member:
                 log.info(f"Attempting 4-ball (Book Group → Yes — fast path). Partners: {partners_4}")
                 discord_notify(f"🎯 {MEMBER_TO_FIRST.get(username, username)} attempting 4-ball booking (fast)...", log)
-                success = execute_bookgroup_yes_fallback(driver, username, 4, log,
-                                                          cancel_event=fourball_booked)
-                if success:
-                    # extract row_id from current URL if on makeBooking/tee sheet
-                    try:
-                        url_match = re.search(r"booking_row_id=(\d+)", driver.current_url)
-                        if url_match:
-                            row_id = url_match.group(1)
-                    except Exception:
-                        pass
+                success, row_id = execute_bookgroup_yes_fallback(
+                    driver,
+                    username,
+                    4,
+                    log,
+                    cancel_event=fourball_booked,
+                    expected_members=partners_4,
+                )
             else:
                 success = False
 
@@ -2100,7 +2295,8 @@ def worker(
                                                           cancel_event=fourball_booked)
 
             if success and not fourball_booked.is_set():
-                fourball_booked.set()
+                fourball_partners = get_fourball_partners(username)
+                all_fourball = [username] + fourball_partners
                 try:
                     fourball_winner_val.value = username.encode()[:64]
                 except Exception:
@@ -2109,17 +2305,29 @@ def worker(
                     fourball_row_id_val.value = row_id.encode()[:64]
                 except Exception:
                     pass
+                try:
+                    fourball_members_val.value = encode_member_list(all_fourball)
+                except Exception:
+                    pass
+                fourball_verified.set()
+                fourball_booked.set()
                 log.info(f"🏆 4-ball booked by {username}!")
-                fourball_partners = get_fourball_partners(username)
-                all_fourball = [username] + fourball_partners
                 names = [MEMBER_TO_FIRST.get(m, m) for m in all_fourball]
-                caption = f"✅ 4-ball BOOKED by {MEMBER_TO_FIRST.get(username, username)}!\nPlayers: {', '.join(names)}"
+                log.info(f"Verified 4-ball roster: {member_display(all_fourball)}")
+                caption = (
+                    f"✅ 4-ball BOOKED by {MEMBER_TO_FIRST.get(username, username)}!\n"
+                    f"Players verified: {', '.join(names)}"
+                )
                 discord_notify(caption, log)
                 # Upload tee sheet screenshot showing the booking
                 ss_path = RUN_DIR / f"fourball_confirmed_{username}.png"
                 try:
                     driver.save_screenshot(str(ss_path))
-                    discord_upload_screenshot(str(ss_path), "4-ball booking confirmed — tee sheet:", log)
+                    discord_upload_screenshot(
+                        str(ss_path),
+                        f"📸 4-ball confirmed: {member_display(all_fourball)}",
+                        log,
+                    )
                 except Exception as exc:
                     log.warning(f"Failed to capture/upload 4-ball screenshot: {exc}")
                 # Only the winning worker logs out — others stay on tee sheet
@@ -2130,18 +2338,59 @@ def worker(
         else:
             log.info("4-ball already booked by another worker.")
 
-        # ── Attempt 2-ball (ANY worker who is through can attempt this) ────
+        # ── Attempt 2-ball (only one of the verified remaining golfers) ────
         if twoball_booked.is_set():
             log.info("2-ball already booked — nothing left to do.")
             logout(driver, log, username)
             return
 
         if not twoball_booked.is_set():
+            if not fourball_booked.is_set():
+                msg = "4-ball is not verified yet — not attempting 2-ball from this account"
+                log.info(msg)
+                discord_notify(f"⏸️ {MEMBER_TO_FIRST.get(username, username)}: {msg}", log)
+                logout(driver, log, username)
+                return
+
+            verified_fourball_members: List[str] = []
+            wait_deadline = time.time() + 45
+            while time.time() < wait_deadline:
+                try:
+                    verified_fourball_members = decode_member_list(fourball_members_val.value)
+                except Exception:
+                    verified_fourball_members = []
+                if fourball_verified.is_set() and len(verified_fourball_members) == 4:
+                    break
+                log.info("Waiting for verified 4-ball roster before 2-ball decision...")
+                time.sleep(2)
+
+            if not fourball_verified.is_set() or len(verified_fourball_members) != 4:
+                msg = "4-ball event was set but verified roster was unavailable — refusing 2-ball"
+                log.error(msg)
+                discord_notify(f"🛑 {MEMBER_TO_FIRST.get(username, username)}: {msg}", log)
+                logout(driver, log, username)
+                return
+
             try:
                 winner = fourball_winner_val.value.decode().rstrip('\x00')
             except Exception:
                 winner = ""
-            partners_2 = get_twoball_partner(username, winner)
+            partners_2, remaining_members, eligibility = get_twoball_partner_from_verified_roster(
+                username,
+                verified_fourball_members,
+            )
+            log.info(f"Verified 4-ball winner: {winner or '(unknown)'}")
+            log.info(f"Verified 4-ball roster: {member_display(verified_fourball_members)}")
+            log.info(f"Remaining golfers for 2-ball: {member_display(remaining_members)}")
+            log.info(f"2-ball eligibility for {username}: {eligibility}")
+            if not partners_2:
+                discord_notify(
+                    f"↪️ {MEMBER_TO_FIRST.get(username, username)} standing down for 2-ball: {eligibility}. "
+                    f"Remaining: {member_display(remaining_members) or 'unknown'}",
+                    log,
+                )
+                logout(driver, log, username)
+                return
             try:
                 skip_ids = set()
                 raw = fourball_row_id_val.value
@@ -2156,7 +2405,11 @@ def worker(
                 log.warning(f"Failed to read fourball_row_id_val: {exc}")
                 skip_ids = set()
             log.info(f"Attempting 2-ball (search method). Adding: {partners_2}")
-            discord_notify(f"🎯 {MEMBER_TO_FIRST.get(username, username)} attempting 2-ball booking...", log)
+            discord_notify(
+                f"🎯 {MEMBER_TO_FIRST.get(username, username)} attempting verified 2-ball with "
+                f"{member_display(partners_2)}. 4-ball roster: {member_display(verified_fourball_members)}",
+                log,
+            )
             success, _ = execute_search_booking(
                 driver,
                 username,
@@ -2169,9 +2422,15 @@ def worker(
 
             if not success and not twoball_booked.is_set():
                 log.warning("Search booking failed for 2-ball — trying Book Group → Yes fallback")
-                success = execute_bookgroup_yes_fallback(driver, username, 2, log,
-                                                          skip_row_ids=skip_ids,
-                                                          cancel_event=twoball_booked)
+                success, _ = execute_bookgroup_yes_fallback(
+                    driver,
+                    username,
+                    2,
+                    log,
+                    skip_row_ids=skip_ids,
+                    cancel_event=twoball_booked,
+                    expected_members=partners_2,
+                )
 
             if success and not twoball_booked.is_set():
                 twoball_booked.set()
@@ -2183,7 +2442,11 @@ def worker(
                 ss_path = RUN_DIR / f"twoball_confirmed_{username}.png"
                 try:
                     driver.save_screenshot(str(ss_path))
-                    discord_upload_screenshot(str(ss_path), "2-ball booking confirmed — tee sheet:", log)
+                    discord_upload_screenshot(
+                        str(ss_path),
+                        f"📸 2-ball confirmed: {member_display([username] + partners_2)}",
+                        log,
+                    )
                 except Exception as exc:
                     log.warning(f"Failed to capture/upload 2-ball screenshot: {exc}")
                 logout(driver, log, username)
@@ -2355,14 +2618,22 @@ def main() -> None:
     log.info(f"Login stagger: {LOGIN_STAGGER_SECS}s between workers")
     log.info(f"Logs: {RUN_DIR}")
 
-    discord_notify(f"🏌️ Booking run started — targeting {target_day} {target_date}", log)
+    discord_notify(
+        f"🏌️ Booking run started — targeting {target_day} {target_date}\n"
+        f"4-ball preference: {member_display(FOUR_BALL_MEMBERS)}\n"
+        f"2-ball preference: {member_display(TWO_BALL_MEMBERS)}\n"
+        f"Workers: {member_display([u['username'] for u in ALL_USERS])}",
+        log,
+    )
 
     manager: SyncManager
     with multiprocessing.Manager() as manager:
         fourball_booked    = manager.Event()
         twoball_booked     = manager.Event()
+        fourball_verified  = manager.Event()
         fourball_winner_val = manager.Value(bytes, b"")
         fourball_row_id_val = manager.Value(bytes, b"")
+        fourball_members_val = manager.Value(bytes, b"")
 
         processes = []
         for idx, user in enumerate(ALL_USERS):
@@ -2376,8 +2647,10 @@ def main() -> None:
                     target_date,
                     fourball_booked,
                     twoball_booked,
+                    fourball_verified,
                     fourball_winner_val,
                     fourball_row_id_val,
+                    fourball_members_val,
                     idx,
                     float(delay),
                 ),
@@ -2402,6 +2675,14 @@ def main() -> None:
         # Capture states BEFORE manager shuts down
         fourball_ok = fourball_booked.is_set()
         twoball_ok  = twoball_booked.is_set()
+        try:
+            fourball_members_final = decode_member_list(fourball_members_val.value)
+        except Exception:
+            fourball_members_final = []
+        try:
+            fourball_row_id_final = fourball_row_id_val.value.decode().rstrip("\x00")
+        except Exception:
+            fourball_row_id_final = ""
 
         # Give workers time to detect events and log out cleanly
         alive = [p for p in processes if p.is_alive()]
@@ -2424,6 +2705,10 @@ def main() -> None:
     log.info("=== SUMMARY ===")
     log.info(f"4-ball booked: {fourball_ok}")
     log.info(f"2-ball booked: {twoball_ok}")
+    if fourball_members_final:
+        log.info(f"Verified 4-ball roster: {member_display(fourball_members_final)}")
+    if fourball_row_id_final:
+        log.info(f"4-ball row id: {fourball_row_id_final}")
     log.info(f"Log directory: {RUN_DIR}")
 
     # Verification — confirm all 6 players appear on the tee sheet
@@ -2441,6 +2726,8 @@ def main() -> None:
     confirmed = verify_result.get("confirmed", [])
     missing = verify_result.get("missing", [])
     summary = f"📊 Final: 4-ball {four_emoji} | 2-ball {two_emoji}"
+    if fourball_members_final:
+        summary += f" | 4-ball: {member_display(fourball_members_final)}"
     if confirmed:
         summary += f" | Verified: {', '.join(confirmed)}"
     if missing:
